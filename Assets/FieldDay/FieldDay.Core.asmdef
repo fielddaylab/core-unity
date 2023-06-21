@@ -1,0 +1,19 @@
+{
+    "name": "FieldDay.Core",
+    "rootNamespace": "",
+    "references": [
+        "BeauUtil",
+        "Unity.TextMeshPro",
+        "EasyBugReporter",
+        "BeauRoutine"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
