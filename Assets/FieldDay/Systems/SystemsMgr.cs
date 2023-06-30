@@ -11,6 +11,8 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using UnityEngine;
 
+using ComponentIndex = BeauUtil.TypeIndex<FieldDay.Components.IComponentData>;
+
 namespace FieldDay.Systems {
     /// <summary>
     /// Manages game system updates.
@@ -228,8 +230,8 @@ namespace FieldDay.Systems {
 
         #region Component Mapping
 
-        private readonly Dictionary<Type, List<IComponentSystem>> m_SystemComponentTypeMap = new Dictionary<Type, List<IComponentSystem>>(32);
-        private readonly Dictionary<Type, List<IComponentSystem>> m_RelevantSystemsMap = new Dictionary<Type, List<IComponentSystem>>(32);
+        private readonly List<IComponentSystem>[] m_SystemComponentTypeMap = new List<IComponentSystem>[ComponentIndex.Capacity];
+        private readonly List<IComponentSystem>[] m_RelevantSystemsMap = new List<IComponentSystem>[ComponentIndex.Capacity];
 
         /// <summary>
         /// Looks up systems for the given component type.
@@ -294,31 +296,23 @@ namespace FieldDay.Systems {
         /// </summary>
         private void RegisterComponentSystem(IComponentSystem componentSystem) {
             Type componentType = componentSystem.ComponentType;
+            int index = ComponentIndex.Get(componentType);
 
             // direct mapping of component type to systems
-            if (!m_SystemComponentTypeMap.TryGetValue(componentType, out List<IComponentSystem> directList)) {
+            List<IComponentSystem> directList = m_SystemComponentTypeMap[index];
+            if (directList == null) {
                 directList = new List<IComponentSystem>(1);
-                m_SystemComponentTypeMap.Add(componentType, directList);
+                m_SystemComponentTypeMap[index] = directList;
             }
             directList.Add(componentSystem);
 
             // mapping of type to all systems that handle that type
-            if (!m_RelevantSystemsMap.TryGetValue(componentType, out List<IComponentSystem> relevantList)) {
+            List<IComponentSystem> relevantList = m_RelevantSystemsMap[index];
+            if (relevantList == null) {
                 relevantList = new List<IComponentSystem>(2);
-                m_RelevantSystemsMap.Add(componentType, relevantList);
+                m_RelevantSystemsMap[index] = relevantList;
             }
             relevantList.Add(componentSystem);
-
-            // if this is for an interface or a non-sealed class
-            // then we'll look for all the types we've tried to register
-            // and, if that type matches, add that to the relevant handlers list
-            if (MayContainMultipleConcreteTypes(componentType)) {
-                foreach (var kv in m_RelevantSystemsMap) {
-                    if (kv.Key != componentType && componentType.IsAssignableFrom(kv.Key)) {
-                        kv.Value.Add(componentSystem);
-                    }
-                }
-            }
         }
 
         /// <summary>
@@ -326,46 +320,36 @@ namespace FieldDay.Systems {
         /// </summary>
         private void DeregisterComponentSystem(IComponentSystem componentSystem) {
             Type componentType = componentSystem.ComponentType;
+            int index = ComponentIndex.Get(componentType);
 
             // remove from direct list
-            if (m_SystemComponentTypeMap.TryGetValue(componentType, out List<IComponentSystem> directList)) {
+            List<IComponentSystem> directList = m_SystemComponentTypeMap[index];
+            if (directList != null) {
                 directList.Remove(componentSystem);
             }
 
             // remove from direct relevant list
-            if (m_RelevantSystemsMap.TryGetValue(componentType, out List<IComponentSystem> relevantList)) {
+            List<IComponentSystem> relevantList = m_RelevantSystemsMap[index];
+            if (relevantList != null) {
                 relevantList.Remove(componentSystem);
             }
-
-            // remove from any relevant lists that are assignable to the component type
-            if (MayContainMultipleConcreteTypes(componentType)) {
-                foreach (var kv in m_RelevantSystemsMap) {
-                    if (kv.Key != componentType && componentType.IsAssignableFrom(kv.Key)) {
-                        kv.Value.Remove(componentSystem);
-                    }
-                }
-            }
-        }
-
-        /// <summary>
-        /// Returns if the given component type could potentially be represented by multiple concrete types.
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        static private bool MayContainMultipleConcreteTypes(Type componentType) {
-            return componentType.IsInterface || !componentType.IsSealed;
         }
 
         /// <summary>
         /// Retrieves the list of all systems relevant for the given component type.
         /// </summary>
         private List<IComponentSystem> GetRelevantSystems(Type componentType, bool createIfNotFound) {
-            if (!m_RelevantSystemsMap.TryGetValue(componentType, out List<IComponentSystem> relevantSystems) && createIfNotFound) {
+            int index = ComponentIndex.Get(componentType);
+            List<IComponentSystem> relevantSystems = m_RelevantSystemsMap[index];
+            if (relevantSystems == null && createIfNotFound) {
                 relevantSystems = new List<IComponentSystem>(Math.Max(m_AllSystems.Count / 4, 2));
 
                 Type checkedType = componentType;
                 while (checkedType != null) {
-                    if (m_SystemComponentTypeMap.TryGetValue(checkedType, out List<IComponentSystem> direct)) {
-                        relevantSystems.AddRange(direct);
+                    int checkedIndex = ComponentIndex.Get(checkedType);
+                    List<IComponentSystem> directList = m_SystemComponentTypeMap[checkedIndex];
+                    if (directList != null) {
+                        relevantSystems.AddRange(directList);
                     }
                     checkedType = checkedType.BaseType;
                     if (ArrayUtils.Contains(StopTypeTraversal, checkedType)) {
@@ -373,13 +357,7 @@ namespace FieldDay.Systems {
                     }
                 }
 
-                foreach(var interfaceType in componentType.GetInterfaces()) {
-                    if (m_SystemComponentTypeMap.TryGetValue(interfaceType, out List<IComponentSystem> fromInterface)) {
-                        relevantSystems.AddRange(fromInterface);
-                    }
-                }
-
-                m_RelevantSystemsMap.Add(componentType, relevantSystems);
+                m_RelevantSystemsMap[index] = relevantSystems;
             }
 
             return relevantSystems;
@@ -431,14 +409,14 @@ namespace FieldDay.Systems {
             m_LateUpdateSystems.Clear();
             m_UnscaledLateUpdateSystems.Clear();
 
-            foreach(var list in m_SystemComponentTypeMap.Values) {
-                list.Clear();
+            foreach(var list in m_SystemComponentTypeMap) {
+                list?.Clear();
             }
-            m_SystemComponentTypeMap.Clear();
-            foreach(var list in m_RelevantSystemsMap.Values) {
-                list.Clear();
+            Array.Clear(m_SystemComponentTypeMap, 0, m_SystemComponentTypeMap.Length);
+            foreach(var list in m_RelevantSystemsMap) {
+                list?.Clear();
             }
-            m_RelevantSystemsMap.Clear();
+            Array.Clear(m_RelevantSystemsMap, 0, m_SystemComponentTypeMap.Length);
             m_InitList.Clear();
 
             while(m_AllSystems.TryPopBack(out ISystem sys)) {
