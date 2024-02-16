@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using UnityEngine;
 using BeauUtil;
 using BeauUtil.Debugger;
+using System.Diagnostics;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -54,7 +55,52 @@ namespace FieldDay {
             Index = (ushort) ((Index + 1) % MaxIndex);
         }
 
+        /// <summary>
+        /// Returns the age of the given index.
+        /// </summary>
+        static public ushort Age(ushort index) {
+            if (index == InvalidIndex) {
+                return InvalidIndex;
+            }
+            int age = index - Index;
+            return (ushort) ((age + MaxIndex) % MaxIndex);
+        }
+
         #endregion // Index
+
+        #region Timestamp
+
+        static private long s_TimestampOffset;
+
+        /// <summary>
+        /// Marks the current timestamp offset.
+        /// </summary>
+        static internal void MarkTimestampOffset() {
+            s_TimestampOffset = Stopwatch.GetTimestamp();
+        }
+
+        /// <summary>
+        /// Returns the current timestamp.
+        /// </summary>
+        static public long Timestamp() {
+            return Stopwatch.GetTimestamp() - s_TimestampOffset;
+        }
+
+        #endregion // Timestamp
+
+        #region Delta Time
+
+        /// <summary>
+        /// Delta time, in seconds.
+        /// </summary>
+        static public float DeltaTime;
+
+        /// <summary>
+        /// Unscaled delta time, in seconds.
+        /// </summary>
+        static public float UnscaledDeltaTime;
+
+        #endregion // Delta Time
 
         #region Allocator
 
@@ -134,7 +180,16 @@ namespace FieldDay {
         /// </summary>
         static public unsafe T* AllocArray<T>(int size) where T : unmanaged {
             T* addr = Unsafe.AllocArray<T>(s_Allocator, size);
-            Assert.True(addr != null, "Per-frame allocator out of space");
+            Assert.True(size <= 0 || addr != null, "Per-frame allocator out of space");
+            return addr;
+        }
+
+        /// <summary>
+        /// Allocates an array of an ummanaged type from the per-frame allocator.
+        /// </summary>
+        static public unsafe UnsafeSpan<T> AllocSpan<T>(int size) where T : unmanaged {
+            UnsafeSpan<T> addr = Unsafe.AllocSpan<T>(s_Allocator, size);
+            Assert.True(size <= 0 || addr.Ptr != null, "Per-frame allocator out of space");
             return addr;
         }
 
@@ -143,7 +198,7 @@ namespace FieldDay {
         /// </summary>
         static public unsafe void* Alloc(int size) {
             void* addr = Unsafe.Alloc(s_Allocator, size);
-            Assert.True(addr != null, "Per-frame allocator out of space");
+            Assert.True(size <= 0 || addr != null, "Per-frame allocator out of space");
             return addr;
         }
 
@@ -204,6 +259,30 @@ namespace FieldDay {
             return true;
         }
 
+        /// <summary>
+        /// Is the given GameObject in a loaded or loading scene.
+        /// </summary>
+        static public bool IsLoadingOrLoaded(Component component) {
+            if (ReferenceEquals(component, null) || !component) {
+                return false;
+            }
+
+            SceneHelper.LoadingState loadingState = component.gameObject.scene.GetLoadingState();
+            return loadingState == SceneHelper.LoadingState.Loading || loadingState == SceneHelper.LoadingState.Loaded;
+        }
+
+        /// <summary>
+        /// Is the given GameObject in a loaded or loading scene.
+        /// </summary>
+        static public bool IsLoadingOrLoaded(GameObject gameObject) {
+            if (ReferenceEquals(gameObject, null) || !gameObject) {
+                return false;
+            }
+
+            SceneHelper.LoadingState loadingState = gameObject.scene.GetLoadingState();
+            return loadingState == SceneHelper.LoadingState.Loading || loadingState == SceneHelper.LoadingState.Loaded;
+        }
+
         #endregion // Active Checks
     
         #region Editor
@@ -212,6 +291,8 @@ namespace FieldDay {
 
         [InitializeOnLoadMethod]
         static private void EditorInitialize() {
+            EditorApplication.update -= EditorAdvance;
+
             EditorApplication.playModeStateChanged += (state) => {
                 if (state == PlayModeStateChange.ExitingEditMode) {
                     DestroyAllocator();

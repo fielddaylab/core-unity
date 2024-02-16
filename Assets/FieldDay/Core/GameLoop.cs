@@ -2,6 +2,10 @@
 #define USE_SRP
 #endif // UNITY_2019_1_OR_NEWER
 
+#if UNITY_EDITOR
+using UnityEditor;
+#endif // UNITY_EDITOR
+
 using System;
 using System.Collections;
 using System.Reflection;
@@ -12,18 +16,32 @@ using FieldDay.SharedState;
 using FieldDay.Systems;
 using UnityEngine;
 using UnityEngine.Scripting;
+using FieldDay.Components;
+using FieldDay.Processes;
+using FieldDay.Data;
+using BeauPools;
+using FieldDay.Audio;
+using System.Collections.Generic;
+using BeauUtil.UI;
+using FieldDay.Scenes;
+using System.Threading;
+using System.Globalization;
+using BeauRoutine;
+using FieldDay.UI;
+using FieldDay.Assets;
+using FieldDay.HID;
+using FieldDay.Rendering;
 
 #if USE_SRP
 using UnityEngine.Rendering;
-using FieldDay.Components;
 #endif // USE_SRP
 
 namespace FieldDay {
     /// <summary>
     /// Game loop manager.
     /// </summary>
-    [DefaultExecutionOrder(-10000000), DisallowMultipleComponent]
-    public sealed class GameLoop : MonoBehaviour {
+    [DefaultExecutionOrder(-23000), DisallowMultipleComponent]
+    public sealed class GameLoop : MonoBehaviour, ICameraPreCullCallback, ICameraPostRenderCallback, ICameraPreRenderCallback {
         #region Inspector
 
         [SerializeField, Tooltip("Size of the per-frame allocation buffer, in KiB")]
@@ -31,6 +49,15 @@ namespace FieldDay {
 
         [SerializeField, Range(30, 120)]
         private int m_TargetFramerate = 60;
+
+        [SerializeField]
+        private Sprite m_DefaultPixelSprite;
+
+        [SerializeField]
+        private bool m_AllowMultiTouchInput = false;
+
+        [SerializeField]
+        private AudioMgr.Config m_AudioConfig = new AudioMgr.Config();
 
         #endregion // Inspector
 
@@ -42,10 +69,20 @@ namespace FieldDay {
         static public readonly CastableEvent<float> OnPreUpdate = new CastableEvent<float>(16);
 
         /// <summary>
+        /// Invoked during DebugUpdate.
+        /// </summary>
+        static public readonly CastableEvent<float> OnDebugUpdate = new CastableEvent<float>(16);
+
+        /// <summary>
         /// Invoked during FixedUpdate.
         /// </summary>
         static public readonly CastableEvent<float> OnFixedUpdate = new CastableEvent<float>(8);
-        
+
+        /// <summary>
+        /// Invoked after FixedUpdate.
+        /// </summary>
+        static public readonly CastableEvent<float> OnLateFixedUpdate = new CastableEvent<float>(8);
+
         /// <summary>
         /// Invoked during Update.
         /// </summary>
@@ -86,23 +123,71 @@ namespace FieldDay {
         /// </summary>
         static public readonly ActionEvent OnShutdown = new ActionEvent(16);
 
+        /// <summary>
+        /// Invoked when the pause state is changed.
+        /// </summary>
+        static public readonly CastableEvent<bool> OnPauseStateChanged = new CastableEvent<bool>(4);
+
+        /// <summary>
+        /// Invoked when the focus state is changed.
+        /// </summary>
+        static public readonly CastableEvent<bool> OnFocusStateChanged = new CastableEvent<bool>(4);
+
         #endregion // Global Events
 
         static private readonly WaitForEndOfFrame s_EndOfFrame = new WaitForEndOfFrame();
+        
+        // action queues
         static private readonly RingBuffer<Action> s_OnBootQueue = new RingBuffer<Action>(16, RingBufferMode.Expand);
         static private readonly RingBuffer<Action> s_FrameStartQueue = new RingBuffer<Action>(16, RingBufferMode.Expand);
         static private readonly RingBuffer<Action> s_AfterLateUpdateQueue = new RingBuffer<Action>(16, RingBufferMode.Expand);
         static private readonly RingBuffer<Action> s_CanvasPreRenderQueue = new RingBuffer<Action>(16, RingBufferMode.Expand);
         static private readonly RingBuffer<Action> s_EndOfFrameQueue = new RingBuffer<Action>(16, RingBufferMode.Expand);
+        
+        // phase tracking
         static internal GameLoopPhase s_CurrentPhase = GameLoopPhase.None;
         static private ushort s_PrevUpdateFrameIndex = Frame.InvalidIndex;
+        static private bool m_ReadyForRender;
+        static private bool s_Initialized;
+
+        // update masks
+        static private int s_UpdateMask = Bits.All32;
+        static private int s_QueuedUpdateMask = Bits.All32;
+
+        // time scales
+        static private float s_TimeScale = 1;
+        static private float s_QueuedTimeScale = 1;
+
+        // pausing
+        static private bool s_DebugPause = false;
+        static private bool s_AppFocusState = false;
+        static private bool s_AppPauseState = false;
+
+        // profiling
+        static private PhaseTiming s_TimeProfiling;
+
+        [NonSerialized] private bool m_Initialized;
 
         #region Unity Events
 
         private void Awake() {
+            if (s_Initialized) {
+                DestroyImmediate(gameObject);
+                return;
+            }
+
+            s_Initialized = true;
+            m_Initialized = true;
             DontDestroyOnLoad(gameObject);
             Log.Msg("[GameLoop] Starting...");
+            Frame.MarkTimestampOffset();
             Frame.CreateAllocator(m_SingleFrameAllocBufferSize);
+            CounterHandle.InitializeAllocator(256);
+
+            Input.multiTouchEnabled = m_AllowMultiTouchInput;
+            CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+            CultureInfo.CurrentUICulture = CultureInfo.InvariantCulture;
+            BuildInfo.Load();
 
             Log.Msg("[GameLoop] Creating systems manager...");
             Game.Systems = new SystemsMgr();
@@ -113,7 +198,35 @@ namespace FieldDay {
             Log.Msg("[GameLoop] Creating shared state manager...");
             Game.SharedState = new SharedStateMgr();
 
+            Log.Msg("[GameLoop] Creating process manager...");
+            Game.Processes = new ProcessMgr();
+
+            Log.Msg("[GameLoop] Creating audio manager...");
+            Game.Audio = new AudioMgr(m_AudioConfig);
+
+            Log.Msg("[GameLoop] Creating scene manager...");
+            Game.Scenes = new SceneMgr();
+
+            Log.Msg("[GameLoop] Creating rendering manager...");
+            Game.Rendering = new RenderMgr();
+
+            Log.Msg("[GameLoop] Creating input manager...");
+            Game.Input = new InputMgr();
+
+            Log.Msg("[GameLoop] Creating gui manager...");
+            Game.Gui = new GuiMgr(Game.Input);
+
+            Log.Msg("[GameLoop] Creating asset manager...");
+            Game.Assets = new AssetMgr();
+
+            CursorUtility.PlatformInit();
+
             Application.targetFrameRate = m_TargetFramerate;
+
+            Log.Msg("[GameLoop] Loading config vars...");
+            ConfigVar.ReadAllFromResources();
+            ConfigVar.ReadUserFromPlayerPrefs();
+            SharedCanvasResources.DefaultWhiteSprite = m_DefaultPixelSprite;
 
             // find all pre-boot
             foreach (var entrypoint in Reflect.FindMethods<InvokePreBootAttribute>(ReflectionCache.UserAssemblies, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static)) {
@@ -123,11 +236,19 @@ namespace FieldDay {
             enabled = false;
             useGUILayout = false;
             StartCoroutine(DelayedBoot());
+
+            Game.Components.Lock();
+
+            Async.InvokeAsync(PotentiallyExpensiveSystemResourceRetrieval);
         }
 
         private void Start() {
             Log.Msg("[GameLoop] Boot finished");
             SetCurrentPhase(GameLoopPhase.Booted);
+            Game.Components.Unlock();
+            Game.Input.Initialize();
+            Game.Gui.Initialize();
+			Game.Scenes.Prepare();
             Game.Systems.ProcessInitQueue();
             FlushQueue(s_OnBootQueue);
 
@@ -137,69 +258,179 @@ namespace FieldDay {
             foreach (var entrypoint in Reflect.FindMethods<InvokeOnBootAttribute>(ReflectionCache.UserAssemblies, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static)) {
                 entrypoint.Info.Invoke(null, null);
             }
+
+            // fallback
+            if (Game.Events == null) {
+                Game.SetEventDispatcher(new EventDispatcher<object>());
+            }
         }
 
         private void FinishCallbackRegistration() {
             Canvas.preWillRenderCanvases += OnPreCanvasRender;
 
-            #if !UNITY_EDITOR
+            CameraHelper.AddOnPreCull(this);
+            CameraHelper.AddOnPreRender(this);
+            CameraHelper.AddOnPostRender(this);
+
+            Application.onBeforeRender += OnBeforeApplicationRender;
+
+#if !UNITY_EDITOR
             StartCoroutine(EndOfFrameCoroutine());
-            #endif // !UNITY_EDITOR
+#endif // !UNITY_EDITOR
+            StartCoroutine(LateFixedUpdateRoutine());
         }
 
         private void OnDestroy() {
+            if (!m_Initialized) {
+                return;
+            }
+
             if (s_CurrentPhase != GameLoopPhase.Shutdown) {
                 OnApplicationQuit();
             }
             Canvas.preWillRenderCanvases -= OnPreCanvasRender;
             Frame.DestroyAllocator();
+            CounterHandle.DestroyAllocator();
+            s_Initialized = m_Initialized = false;
         }
 
         private void OnApplicationQuit() {
+            if (!m_Initialized) {
+                return;
+            }
+
             Log.Msg("[GameLoop] Shutting down...");
             SetCurrentPhase(GameLoopPhase.Shutdown);
             OnShutdown.Invoke();
 
             if (Game.Events != null) {
+                Log.Msg("[GameLoop] Shutting down events...");
                 Game.Events.Clear();
                 Game.SetEventDispatcher(null);
             }
 
+            Application.onBeforeRender -= OnBeforeApplicationRender;
+
+            CameraHelper.RemoveOnPreCull(this);
+            CameraHelper.RemoveOnPreRender(this);
+            CameraHelper.RemoveOnPostRender(this);
+
+            Log.Msg("[GameLoop] Shutting down asset manager...");
+            Game.Assets.Shutdown();
+            Game.Assets = null;
+
+            Log.Msg("[GameLoop] Shutting down gui manager...");
+            Game.Gui.Shutdown();
+            Game.Gui = null;
+
+            Log.Msg("[GameLoop] Shutting down input manager...");
+            Game.Input.Shutdown();
+            Game.Input = null;
+
+            Log.Msg("[GameLoop] Shutting down rendering manager...");
+            Game.Rendering.Shutdown();
+            Game.Rendering = null;
+
+            Log.Msg("[GameLoop] Shutting down scene manager...");
+            Game.Scenes.Shutdown();
+            Game.Scenes = null;
+
+            Log.Msg("[GameLoop] Shutting down audio manager...");
+            Game.Audio.Shutdown();
+            Game.Audio = null;
+
+            Log.Msg("[GameLoop] Shutting down process manager...");
+            Game.Processes.Shutdown();
+            Game.Processes = null;
+
+            Log.Msg("[GameLoop] Shutting down systems manager...");
+            Game.Systems.Shutdown();
+            Game.Systems = null;
+
+            Log.Msg("[GameLoop] Shutting down shared state manager...");
+            Game.SharedState.Shutdown();
+            Game.SharedState = null;
+
+            Log.Msg("[GameLoop] Shutting down component manager...");
             Game.Components.Shutdown();
             Game.Components = null;
 
-            Game.Systems.Shutdown();
-            Game.Systems = null;
+            // clearing all callbacks
+            OnCanvasPreRender.Clear();
+            OnDebugUpdate.Clear();
+            OnFixedUpdate.Clear();
+            OnFrameAdvance.Clear();
+            OnGuiEvent.Clear();
+            OnLateFixedUpdate.Clear();
+            OnLateUpdate.Clear();
+            OnPreUpdate.Clear();
+            OnShutdown.Clear();
+            OnUnscaledLateUpdate.Clear();
+            OnUnscaledUpdate.Clear();
+            OnUpdate.Clear();
+            OnPauseStateChanged.Clear();
+            OnFocusStateChanged.Clear();
+
+            // clearing all callback queues
+            s_AfterLateUpdateQueue.Clear();
+            s_CanvasPreRenderQueue.Clear();
+            s_EndOfFrameQueue.Clear();
+            s_FrameStartQueue.Clear();
+            s_OnBootQueue.Clear();
         }
 
         private void FixedUpdate() {
-            FlushQueue(s_OnBootQueue);
-            HandlePreUpdate();
+            Frame.UnscaledDeltaTime = Time.deltaTime;
+            Frame.DeltaTime = Frame.UnscaledDeltaTime * s_TimeScale;
 
+            HandlePreUpdate();
             SetCurrentPhase(GameLoopPhase.FixedUpdate);
-            Game.Components.Lock();
-            Game.Systems.FixedUpdate(Time.fixedDeltaTime);
-            Game.Components.Unlock();
-            OnFixedUpdate.Invoke(Time.fixedDeltaTime);
+            if (!IsPaused()) {
+                Game.Components.Lock();
+                Game.Systems.FixedUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Processes.FixedUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Components.Unlock();
+                OnFixedUpdate.Invoke(Frame.DeltaTime);
+            }
+        }
+
+        private void LateFixedUpdate() {
+            SetCurrentPhase(GameLoopPhase.LateFixedUpdate);
+            if (!IsPaused()) {
+                Game.Components.Lock();
+                Game.Systems.LateFixedUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Processes.LateFixedUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Components.Unlock();
+                OnLateFixedUpdate.Invoke(Frame.DeltaTime);
+            }
         }
 
         private void Update() {
+            Frame.UnscaledDeltaTime = Time.deltaTime;
+            Frame.DeltaTime = Frame.UnscaledDeltaTime * s_TimeScale;
+
             // just in case we didn't have a FixedUpdate this frame
             HandlePreUpdate();
 
             // time-scaled update
             SetCurrentPhase(GameLoopPhase.Update);
-            Game.Components.Lock();
-            Game.Systems.Update(Time.deltaTime);
-            Game.Components.Unlock();
-            OnUpdate.Invoke(Time.deltaTime);
+            if (!IsPaused()) {
+                Game.Components.Lock();
+                Game.Systems.Update(Frame.DeltaTime, s_UpdateMask);
+                Game.Processes.Update(Frame.DeltaTime, s_UpdateMask);
+                Game.Components.Unlock();
+                OnUpdate.Invoke(Frame.DeltaTime);
+            }
 
             // unscaled update
             SetCurrentPhase(GameLoopPhase.UnscaledUpdate);
-            Game.Components.Lock();
-            Game.Systems.UnscaledUpdate(Time.unscaledDeltaTime);
-            Game.Components.Unlock();
-            OnUnscaledUpdate.Invoke(Time.unscaledDeltaTime);
+            if (!IsPaused()) {
+                Game.Components.Lock();
+                Game.Systems.UnscaledUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                Game.Processes.UnscaledUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                Game.Components.Unlock();
+                OnUnscaledUpdate.Invoke(Frame.UnscaledDeltaTime);
+            }
 
             // flush event queue
             Game.Events?.Flush();
@@ -208,45 +439,84 @@ namespace FieldDay {
         private void LateUpdate() {
             // time-scaled late update
             SetCurrentPhase(GameLoopPhase.LateUpdate);
-            Game.Components.Lock();
-            Game.Systems.LateUpdate(Time.unscaledDeltaTime);
-            Game.Components.Unlock();
-            OnLateUpdate.Invoke(Time.deltaTime);
+            if (!IsPaused()) {
+                Game.Components.Lock();
+                Game.Systems.LateUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Processes.LateUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Components.Unlock();
+                OnLateUpdate.Invoke(Frame.DeltaTime);
+            }
 
             // unscaled late update
             SetCurrentPhase(GameLoopPhase.UnscaledLateUpdate);
-            Game.Components.Lock();
-            Game.Systems.UnscaledLateUpdate(Time.unscaledDeltaTime);
-            Game.Components.Unlock();
-            OnUnscaledLateUpdate.Invoke(Time.unscaledDeltaTime);
+            if (!IsPaused()) {
+                Game.Components.Lock();
+                Game.Systems.UnscaledLateUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                Game.Processes.UnscaledLateUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                Game.Components.Unlock();
+                OnUnscaledLateUpdate.Invoke(Frame.UnscaledDeltaTime);
+            }
+
+            Game.Gui.ProcessUpdate();
+            Game.Audio.Update(Frame.UnscaledDeltaTime);
 
             // flush event queue
             Game.Events?.Flush();
 
             FlushQueue(s_AfterLateUpdateQueue);
+            Game.Scenes.Update();
+            Game.Rendering.PollScreenSettings();
+
+            m_ReadyForRender = true;
         }
 
         private void OnGUI() {
             EventType type = Event.current.type;
             OnGuiEvent.Invoke(Event.current);
 
-            #if UNITY_EDITOR
+#if UNITY_EDITOR
             if (type == EventType.Repaint) {
                 OnEndOfFrame();
             }
-            #endif // UNITY_EDITOR
+#endif // UNITY_EDITOR
         }
 
-        private void OnCameraPreCull() {
+        void ICameraPreCullCallback.OnCameraPreCull(Camera camera, CameraCallbackSource source) {
+            if (!m_ReadyForRender) {
+                return;
+            }
 
+            SetCurrentPhase(GameLoopPhase.PreCull);
         }
 
-        private void OnCameraPreRender() {
+        void ICameraPreRenderCallback.OnCameraPreRender(Camera camera, CameraCallbackSource source) {
+            if (!m_ReadyForRender) {
+                return;
+            }
 
+            SetCurrentPhase(GameLoopPhase.PreRender);
         }
 
-        private void OnCameraPostRender() {
+        void ICameraPostRenderCallback.OnCameraPostRender(Camera camera, CameraCallbackSource source) {
+            if (!m_ReadyForRender) {
+                return;
+            }
 
+            SetCurrentPhase(GameLoopPhase.PostRender);
+        }
+
+        private void OnBeforeApplicationRender() {
+#if UNITY_EDITOR
+            if (EditorApplication.isPaused) {
+                return;
+            }
+#endif // UNITY_EDITOR
+            SetCurrentPhase(GameLoopPhase.ApplicationPreRender);
+            if (!IsPaused()) {
+                Game.Components.Lock();
+                Game.Systems.ApplicationPreRender(Frame.DeltaTime, s_UpdateMask);
+                Game.Components.Unlock();
+            }
         }
 
         private IEnumerator DelayedBoot() {
@@ -254,11 +524,29 @@ namespace FieldDay {
             enabled = true;
         }
 
-        static private IEnumerator EndOfFrameCoroutine() {
+        private IEnumerator LateFixedUpdateRoutine() {
+            object fixedUpdate = new WaitForFixedUpdate();
             while(true) {
+                yield return fixedUpdate;
+                LateFixedUpdate();
+            }
+        }
+
+        static private IEnumerator EndOfFrameCoroutine() {
+            while (true) {
                 yield return s_EndOfFrame;
                 OnEndOfFrame();
             }
+        }
+
+        private void OnApplicationFocus(bool focus) {
+            s_AppFocusState = focus;
+            OnFocusStateChanged.Invoke(focus);
+        }
+
+        private void OnApplicationPause(bool pause) {
+            s_AppPauseState = pause;
+            OnPauseStateChanged.Invoke(pause);
         }
 
         #endregion // Unity Events
@@ -267,15 +555,46 @@ namespace FieldDay {
 
         static private void HandlePreUpdate() {
             if (s_PrevUpdateFrameIndex != Frame.Index) {
-                SetCurrentPhase(GameLoopPhase.PreUpdate);
+                ReportPerfTimings(s_TimeProfiling);
+                s_TimeProfiling.Clear();
+
+                SetCurrentPhase(GameLoopPhase.DebugUpdate);
                 s_PrevUpdateFrameIndex = Frame.Index;
+                Frame.UnscaledDeltaTime = Time.unscaledDeltaTime;
+                DequeueNextValues();
                 FlushQueue(s_FrameStartQueue);
 
+                FlushQueue(s_OnBootQueue);
+
+                Game.Input.UpdateDoubleClickBuffer();
+
+                // DEBUG UPDATE
                 Game.Components.Lock();
-                Game.Systems.PreUpdate(Time.unscaledDeltaTime);
+                Game.Systems.DebugUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                Game.Processes.DebugUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
                 Game.Components.Unlock();
 
-                OnPreUpdate.Invoke(Time.unscaledDeltaTime);
+                OnDebugUpdate.Invoke(Frame.UnscaledDeltaTime);
+                Game.Audio.PreUpdate(Frame.UnscaledDeltaTime);
+
+                // PRE UPDATE
+
+                SetCurrentPhase(GameLoopPhase.PreUpdate);
+                Frame.UnscaledDeltaTime = Time.deltaTime;
+                DequeueNextValues();
+
+                if (!IsPaused()) {
+                    Game.Components.Lock();
+                    Game.Systems.PreUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                    Game.Processes.PreUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                    Game.Components.Unlock();
+
+                    OnPreUpdate.Invoke(Frame.UnscaledDeltaTime);
+                }
+
+                DequeueNextValues();
+
+                m_ReadyForRender = false;
             }
         }
 
@@ -291,7 +610,34 @@ namespace FieldDay {
 
             Frame.IncrementFrame();
             Frame.ResetAllocator();
+            DequeueNextValues();
+            Game.Processes.FrameAdvanced();
             OnFrameAdvance.Invoke(Frame.Index);
+            m_ReadyForRender = false;
+        }
+
+        static private void DequeueNextValues() {
+            s_UpdateMask = s_QueuedUpdateMask;
+            s_TimeScale = s_QueuedTimeScale;
+            Frame.DeltaTime = Frame.UnscaledDeltaTime * s_TimeScale;
+        }
+
+        static private unsafe void ReportPerfTimings(PhaseTiming timing) {
+            // TODO: Implement
+            //using(PooledStringBuilder psb = PooledStringBuilder.Create()) {
+            //    psb.Builder.Append("[GameLoop] PreUpdate ").AppendNoAlloc(timing.Duration[0]).Append("\n FixedUpdate ").AppendNoAlloc(timing.Duration[1])
+            //        .Append("\n Update ").AppendNoAlloc(timing.Duration[2] + timing.Duration[3])
+            //        .Append("\n LateUpdate ").AppendNoAlloc(timing.Duration[4] + timing.Duration[5])
+            //        .Append("\n CanvasPreRender ").AppendNoAlloc(timing.Duration[6])
+            //        .Append("\n CameraPreCull ").AppendNoAlloc(timing.Duration[7]).Append("\n CameraPreRender ").AppendNoAlloc(timing.Duration[8])
+            //        .Append("\n CameraPostRender ").AppendNoAlloc(timing.Duration[9])
+            //        .Append("\n FrameAdvanced ").AppendNoAlloc(timing.Duration[10]);
+            //    Log.Msg(psb.Builder.Flush());
+            //}
+        }
+
+        static private void PotentiallyExpensiveSystemResourceRetrieval() {
+            char.IsWhiteSpace('0'); // char.IsWhitespace has sometimes caused spikes due to retrieval of system resources *shrug*
         }
 
         #endregion // Handlers
@@ -345,22 +691,44 @@ namespace FieldDay {
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static private void SetCurrentPhase(GameLoopPhase phase) {
-            s_CurrentPhase = phase;
-            //Log.Msg("[GameLoop] Entering phase '{0}' on frame {1}", phase, Frame.Index);
+            if (s_CurrentPhase != phase) {
+                s_TimeProfiling.MarkEnd(s_CurrentPhase);
+                s_CurrentPhase = phase;
+                s_TimeProfiling.MarkStart(phase);
+                //Log.Msg("[GameLoop] Entering phase '{0}' on frame {1}", phase, Frame.Index);
+            }
         }
 
         /// <summary>
         /// Is the game loop currently executing pre-update, fixed update, or late update.
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static public bool IsUpdating() {
-            return PhaseInRange(s_CurrentPhase, GameLoopPhase.PreUpdate, GameLoopPhase.UnscaledLateUpdate);
+            return PhaseInRange(s_CurrentPhase, GameLoopPhase.DebugUpdate, GameLoopPhase.UnscaledLateUpdate);
         }
 
         /// <summary>
         /// Is the game loop currently executing rendering steps.
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static public bool IsRendering() {
             return PhaseInRange(s_CurrentPhase, GameLoopPhase.PreCull, GameLoopPhase.PostRender);
+        }
+
+        /// <summary>
+        /// Is the game loop currently executing the given phase.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public bool IsPhase(GameLoopPhase phase) {
+            return s_CurrentPhase == phase;
+        }
+
+        /// <summary>
+        /// Is the game loop currently executing any of the given phases.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public bool IsPhase(GameLoopPhaseMask phaseMask) {
+            return ((GameLoopPhaseMask) (1u << (int) s_CurrentPhase) & phaseMask) != 0;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -369,6 +737,73 @@ namespace FieldDay {
         }
 
         #endregion // Phase
+
+        #region Update Mask
+
+        /// <summary>
+        /// Mask of all process and system categories allowed to update.
+        /// </summary>
+        static public int UpdateMask { get { return s_UpdateMask; } }
+
+        /// <summary>
+        /// Queues updates for specific categories to be suspended.
+        /// </summary>
+        static public void SuspendUpdates(int suspendMask) {
+            s_QueuedUpdateMask &= ~suspendMask;
+        }
+
+        /// <summary>
+        /// Returns if the any update category of the given mask is suspended.
+        /// </summary>
+        static public bool IsSuspended(int updateMask) {
+            return (s_UpdateMask & updateMask) != updateMask;
+        }
+
+        /// <summary>
+        /// Queues updates for specific categories to be resumed.
+        /// </summary>
+        static public void ResumeUpdates(int resumeMask) {
+            s_QueuedUpdateMask |= resumeMask;
+        }
+
+        #endregion // Update Mask
+
+        #region Time Scale
+
+        /// <summary>
+        /// Custom GameLoop timescale.
+        /// </summary>
+        static public float TimeScale {
+            get { return s_TimeScale; }
+            set { s_QueuedTimeScale = value; }
+        }
+
+        #endregion // Time Scale
+
+        #region Pausing
+
+        /// <summary>
+        /// Returns if the game loop is paused.
+        /// </summary>
+        static public bool IsPaused() {
+            return s_DebugPause || s_AppPauseState;
+        }
+
+        /// <summary>
+        /// Sets the debug pause value.
+        /// </summary>
+        static internal void SetDebugPause(bool paused) {
+            s_DebugPause = paused;
+        }
+
+        /// <summary>
+        /// Returns if the application is focused.
+        /// </summary>
+        static public bool IsFocused() {
+            return s_AppFocusState;
+        }
+
+        #endregion // Pausing
     }
 
     /// <summary>
@@ -379,14 +814,17 @@ namespace FieldDay {
         [Label("None")] None,
         [Label("Booted")] Booted,
 
+        [Label("Debug Update")] DebugUpdate,
         [Label("Pre Update")] PreUpdate,
         [Label("Fixed Update")] FixedUpdate,
+        [Label("Late Fixed Update")] LateFixedUpdate,
         [Label("Update")] Update,
         [Label("Unscaled Update")] UnscaledUpdate,
         [Label("Late Update")] LateUpdate,
         [Label("Unscaled Late Update")] UnscaledLateUpdate,
 
         [Label("Canvas Pre-Render")] CanvasPreRender,
+        [Label("Application Pre-Render")] ApplicationPreRender,
 
         [Label("Pre-Cull")] PreCull,
         [Label("Pre-Render")] PreRender,
@@ -395,6 +833,35 @@ namespace FieldDay {
         [Label("Frame Advanced")] FrameAdvance,
 
         [Label("Shutdown")] Shutdown,
+    }
+
+    /// <summary>
+    /// Game loop phase mask.
+    /// </summary>
+    [Flags]
+    public enum GameLoopPhaseMask : uint {
+        None = 0,
+        Booted = 1 << (int) GameLoopPhase.Booted,
+
+        DebugUpdate = 1 << (int) GameLoopPhase.DebugUpdate,
+        PreUpdate = 1 << (int) GameLoopPhase.PreUpdate,
+        FixedUpdate = 1 << (int) GameLoopPhase.FixedUpdate,
+        LateFixedUpdate = 1 << (int) GameLoopPhase.LateFixedUpdate,
+        Update = 1 << (int) GameLoopPhase.Update,
+        UnscaledUpdate = 1 << (int) GameLoopPhase.UnscaledUpdate,
+        LateUpdate = 1 << (int) GameLoopPhase.LateUpdate,
+        UnscaledLateUpdate = 1 << (int) GameLoopPhase.UnscaledLateUpdate,
+
+        CanvasPreRender = 1 << (int) GameLoopPhase.CanvasPreRender,
+        ApplicationPreRender = 1 << (int) GameLoopPhase.ApplicationPreRender,
+
+        PreCull = 1 << (int) GameLoopPhase.PreCull,
+        PreRender = 1 << (int) GameLoopPhase.PreRender,
+        PostRender = 1 << (int) GameLoopPhase.PostRender,
+
+        FrameAdvance = 1 << (int) GameLoopPhase.FrameAdvance,
+
+        Shutdown = 1 << (int) GameLoopPhase.Shutdown,
     }
 
     /// <summary>

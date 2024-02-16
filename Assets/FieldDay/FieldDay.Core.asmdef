@@ -5,7 +5,17 @@
         "BeauUtil",
         "Unity.TextMeshPro",
         "EasyBugReporter",
-        "BeauRoutine"
+        "BeauRoutine",
+        "BeauPools",
+        "BeauData",
+        "BeauUtil.Parse",
+        "BeauRoutine-Extensions",
+        "BeauRoutine-Spline",
+        "Unity.RenderPipelines.Universal.Runtime",
+        "ScriptableBake",
+        "UWTStream",
+        "EasyAssetStreaming",
+        "NativeInput"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
@@ -14,6 +24,12 @@
     "precompiledReferences": [],
     "autoReferenced": true,
     "defineConstraints": [],
-    "versionDefines": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.render-pipelines.universal",
+            "expression": "0.0.1",
+            "define": "HAS_URP"
+        }
+    ],
     "noEngineReferences": false
 }
