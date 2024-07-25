@@ -13,22 +13,33 @@ namespace FieldDay.Editor {
         /// </summary>
         static public BuildConfig GetDesiredConfig(string branchName) {
             if (string.IsNullOrEmpty(branchName)) {
-                Debug.LogWarningFormat("No branch name?");
+                Debug.LogWarningFormat("[BuildConfigurations] No branch name?");
                 return null;
             }
 
-            BuildConfig[] configs = AssetDBUtils.FindAssets<BuildConfig>(); 
-            Array.Sort(configs, (a, b) => a.Order - b.Order);
+            BuildConfig[] configs = AssetDBUtils.FindAssets<BuildConfig>();
+            if (configs.Length == 0) {
+                Debug.LogWarningFormat("[BuildConfigurations] No configs located. Retrying...");
+                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                configs = AssetDBUtils.FindAssets<BuildConfig>();
+            }
 
+            if (configs.Length == 0) {
+                Debug.LogWarningFormat("[BuildConfigurations] No configs found!");
+                return null;
+            }
+
+            Array.Sort(configs, (a, b) => a.Order - b.Order);
             //Debug.LogFormat("Found {0} build configurations when lookup under branch '{1}'", configs.Length, branchName);
 
-            for(int buildIdx = 0; buildIdx < configs.Length; buildIdx++) {
+            for (int buildIdx = 0; buildIdx < configs.Length; buildIdx++) {
                 BuildConfig config = configs[buildIdx];
                 if (WildcardMatch.Match(branchName, config.BranchNamePatterns, '*', true)) {
                     return config;
                 }
             }
 
+            Debug.LogWarningFormat("[BuildConfigurations] No configs found matching branch '{0}' out of {1} configs!", branchName, configs.Length);
             return null;
         }
 
@@ -37,12 +48,11 @@ namespace FieldDay.Editor {
         /// <summary>
         /// Applies the given build configuration settings.
         /// </summary>
-        static public void ApplyBuildConfig(string branchName, string configName, bool development, string defines, bool forceLogs = false) {
+        static public void ApplyBuildConfig(string branchName, string configName, bool development, string defines, ManagedStrippingLevel codeStripping, bool forceLogs = false) {
             bool logging = forceLogs;
             if (!logging) {
                 if ((InternalEditorUtility.inBatchMode || !InternalEditorUtility.isHumanControllingUs)) {
                     logging = true;
-                    Debug.LogFormat("batch mode?");
                 } else if (File.Exists(LibraryBuildConfigFile)) {
                     string lastApplied = File.ReadAllText(LibraryBuildConfigFile);
                     //Debug.LogFormat("last config is '{0}' vs now '{1}'", lastApplied, configName);
@@ -54,6 +64,7 @@ namespace FieldDay.Editor {
                 Debug.LogFormat("[BuildConfigurations] Source control branch is '{0}', applying build configuration '{1}'", branchName, configName);
             }
 
+            PlayerSettings.SetManagedStrippingLevel(EditorUserBuildSettings.selectedBuildTargetGroup, codeStripping);
             EditorUserBuildSettings.development = development; 
             BuildUtils.WriteDefines(defines);
 
@@ -85,10 +96,16 @@ namespace FieldDay.Editor {
             string branchName = BuildUtils.GetSourceControlBranchName();
             BuildConfig config = GetDesiredConfig(branchName);
             if (config != null) {
-                ApplyBuildConfig(branchName, AssetDatabase.GetAssetPath(config), config.DevelopmentBuild, config.CustomDefines, forceLogging);
+                ApplyBuildConfig(branchName, AssetDatabase.GetAssetPath(config), config.DevelopmentBuild, config.CustomDefines, config.StrippingLevel, forceLogging);
             } else {
-                Debug.LogWarningFormat("no build config found??");
-                ApplyBuildConfig(branchName, "[fallback]", true, "DEVELOPMENT,PRESERVE_DEBUG_SYMBOLS", forceLogging);
+                Debug.LogWarningFormat("[BuildConfigurations] Using hard-coded fallback configurations for branch '{0}'", branchName);
+                if (branchName == "production") {
+                    ApplyBuildConfig(branchName, "[fallback-production]", false, "PRODUCTION", ManagedStrippingLevel.Minimal, forceLogging);
+                } else if (branchName == "preview") {
+                    ApplyBuildConfig(branchName, "[fallback-preview]", false, "PREVIEW,ENABLE_LOGGING_ERRORS_BEAUUTIL,ENABLE_LOGGING_WARNINGS_BEAUUTIL,PRESERVE_DEBUG_SYMBOLS", ManagedStrippingLevel.Minimal, forceLogging);
+                } else {
+                    ApplyBuildConfig(branchName, "[fallback-dev]", true, "DEVELOPMENT,PRESERVE_DEBUG_SYMBOLS", ManagedStrippingLevel.Minimal, forceLogging);
+                }
             }
         }
 

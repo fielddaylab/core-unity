@@ -18,8 +18,10 @@ MonoBehaviour:
   - '*debug*'
   - feature/*
   - improvement/*
+  - fixes/*
   - experimental/*
   - main
   DevelopmentBuild: 1
+  StrippingLevel: 2
   CustomDefines: DEVELOPMENT,PRESERVE_DEBUG_SYMBOLS
   Order: 0

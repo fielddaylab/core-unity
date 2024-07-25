@@ -4,10 +4,12 @@
     "version": "0.1.2",
     "unity": "2019.3",
     "dependencies": {
-        "com.beauprime.beauutil": "0.9.1",
+        "com.beauprime.beauutil": "0.10.8",
         "com.beauprime.beauroutine": "0.11.1",
-        "com.beauprime.beaupools": "0.2.3",
-        "com.unity.textmeshpro": "3.0.6"
+        "com.beauprime.beaupools": "0.3.1",
+		"com.beauprime.beaudata": "0.3.1",
+        "com.unity.textmeshpro": "3.0.6",
+		"com.beauprime.tinyil-mono": "0.2.1"
     },
     "type": "library",
     "license": "MIT",

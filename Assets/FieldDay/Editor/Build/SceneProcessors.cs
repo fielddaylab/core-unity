@@ -1,8 +1,13 @@
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#define DEVELOPMENT
+#endif // UNITY_EDITOR || DEVELOPMENT_BUILD
+
 using System.Collections.Generic;
 using BeauUtil;
 using BeauUtil.Debugger;
 using FieldDay.Data;
 using FieldDay.Debugging;
+using FieldDay.Perf;
 using FieldDay.Rendering;
 using FieldDay.Scenes;
 using ScriptableBake;
@@ -98,6 +103,16 @@ namespace FieldDay.Editor {
                     GameObject.DestroyImmediate(obj.gameObject);
                 }
             }
+
+#if DISABLE_FRAMERATE_COUNTER
+            FramerateDisplay[] toRemoveFramerates = GameObject.FindObjectsOfType<FramerateDisplay>();
+            if (toRemoveFramerates.Length > 0) {
+                Debug.LogFormat("[StripDebugSceneProcessor] Removing {0} FramerateDisplay GameObjects from scene '{1}'", toRemoveFramerates.Length, scene.name);
+                foreach(var obj in toRemoveFramerates) {
+                    GameObject.DestroyImmediate(obj.gameObject);
+                }
+            }
+#endif // DISABLE_FRAMERATE_COUNTER
 
             List<IDevModeOnly> devModeOnlyComponents = new List<IDevModeOnly>(256);
             scene.GetAllComponents(true, devModeOnlyComponents);
@@ -211,6 +226,7 @@ namespace FieldDay.Editor {
                     Scene subsceneRef = EditorSceneManager.GetSceneByPath(settings.Path);
 
                     EditorSceneManager.OpenScene(settings.Path, OpenSceneMode.Additive);
+                    Assert.True(subsceneRef.IsValid(), "Scene '{0}' is not valid", settings.Path);
                     foreach (var root in subsceneRef.GetRootGameObjects()) {
                         root.GetComponentsInChildren(true, importBuffer);
                         foreach(var subImport in importBuffer) {
@@ -222,7 +238,7 @@ namespace FieldDay.Editor {
                     }
 
                     if ((settings.Flags & SceneImportFlags.ImportLightingSettings) != 0) {
-                        LightUtility.CopySettingsToScene(subsceneRef, scene);
+                        LightUtility.CopySettingsToScene(subsceneRef, scene, LightingImportFlags.All);
                     }
 
                     EditorSceneManager.CloseScene(subsceneRef, true);

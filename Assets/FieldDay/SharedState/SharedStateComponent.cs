@@ -1,4 +1,5 @@
 using System;
+using BeauUtil;
 using UnityEngine;
 
 namespace FieldDay.SharedState {
@@ -7,14 +8,15 @@ namespace FieldDay.SharedState {
     /// This data will be globally accessible while this component is active.
     /// </summary>
     [DefaultExecutionOrder(SharedStateComponent.DefaultExecutionOrder)]
+    [NonIndexed]
     public abstract class SharedStateComponent : MonoBehaviour, ISharedState {
         public const int DefaultExecutionOrder = -20000;
 
-        private void OnEnable() {
+        protected virtual void OnEnable() {
             Game.SharedState.Register(this);
         }
 
-        private void OnDisable() {
+        protected virtual void OnDisable() {
             if (!Game.IsShuttingDown) {
                 Game.SharedState.Deregister(this);
             }

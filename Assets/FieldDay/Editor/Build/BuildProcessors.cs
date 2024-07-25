@@ -23,17 +23,22 @@ namespace FieldDay.Editor {
             if (isBatchMode) {
                 PlayerSettings.SplashScreen.show = false;
                 PlayerSettings.SplashScreen.showUnityLogo = false;
+                EditorUserBuildSettings.connectProfiler = false;
+                EditorUserBuildSettings.buildWithDeepProfilingSupport = false;
                 PlayerSettings.SetStackTraceLogType(LogType.Log, StackTraceLogType.None);
+            }
+
+            BuildConfig config = BuildConfigurations.GetDesiredConfig(branch);
+            if (config != null) {
+                BuildConfigurations.ApplyBuildConfig(branch, AssetDatabase.GetAssetPath(config), config.DevelopmentBuild, config.CustomDefines, config.StrippingLevel, true);
             }
 
             if (EditorUserBuildSettings.development) {
                 PlayerSettings.WebGL.exceptionSupport = WebGLExceptionSupport.FullWithStacktrace;
                 PlayerSettings.WebGL.debugSymbolMode = WebGLDebugSymbolMode.Embedded;
-                PlayerSettings.SetManagedStrippingLevel(EditorUserBuildSettings.selectedBuildTargetGroup, ManagedStrippingLevel.Medium);
             } else {
                 PlayerSettings.WebGL.exceptionSupport = WebGLExceptionSupport.ExplicitlyThrownExceptionsOnly;
                 PlayerSettings.WebGL.debugSymbolMode = WebGLDebugSymbolMode.Off;
-                PlayerSettings.SetManagedStrippingLevel(EditorUserBuildSettings.selectedBuildTargetGroup, ManagedStrippingLevel.Medium);
             }
 
             Debug.LogFormat("[AdjustSettingsBuildProcessor] Building branch '{0}', development mode {1}", branch, EditorUserBuildSettings.development);
@@ -73,7 +78,7 @@ namespace FieldDay.Editor {
 
             List<IEditorOnlyData> toStrip = new List<IEditorOnlyData>(256);
             ScriptableObject[] assets = AssetDBUtils.FindAssets<ScriptableObject>();
-            foreach(var asset in assets) {
+            foreach (var asset in assets) {
                 IEditorOnlyData data;
                 if ((data = asset as IEditorOnlyData) != null) {
                     toStrip.Add(data);
@@ -91,7 +96,7 @@ namespace FieldDay.Editor {
                             EditorUtility.SetDirty(src);
                         }
                     }
-                } catch(Exception e) {
+                } catch (Exception e) {
                     throw new BuildFailedException(e);
                 }
             }

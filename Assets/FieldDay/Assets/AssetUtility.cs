@@ -40,7 +40,7 @@ namespace FieldDay.Assets {
             if (!ReferenceEquals(asset, null)) {
                 Assert.True(IsPersistent(asset), "Asset is not persistent");
                 Debug.LogWarningFormat("[AssetUtility] Manually destroying asset '{0}'!", asset.name);
-#if UNITY_EDITOR
+#if !UNITY_EDITOR
                 UnityEngine.Object.DestroyImmediate(asset, true);
 #else
                 Resources.UnloadAsset(asset);
@@ -68,6 +68,53 @@ namespace FieldDay.Assets {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static public bool IsPersistent(UnityEngine.Object obj) {
             return UnityHelper.IsPersistent(obj);
+        }
+
+        /// <summary>
+        /// Caches the name hash of the given object.
+        /// </summary>
+        static public StringHash32 CacheNameHash(ref StringHash32 hash, UnityEngine.Object obj) {
+            if (hash.IsEmpty) {
+                hash = obj.name;
+            }
+            return hash;
+        }
+
+        /// <summary>
+        /// Caches the name hash of the given object.
+        /// </summary>
+        static public StringHash32 CacheNameHash(ref StringHash32 hash, object asset) {
+            if (hash.IsEmpty) {
+                hash = NameOf(asset);
+            }
+            return hash;
+        }
+
+        /// <summary>
+        /// Returns the name of the given object.
+        /// </summary>
+        static public string NameOf(UnityEngine.Object obj) {
+            if (obj == null) {
+                return null;
+            }
+
+            return obj.name;
+        }
+
+        /// <summary>
+        /// Returns the name of the given object.
+        /// </summary>
+        static public string NameOf(object asset) {
+            if (asset == null) {
+                return null;
+            }
+
+            UnityEngine.Object obj = asset as UnityEngine.Object;
+            if (obj != null) {
+                return obj.name;
+            }
+
+            return asset.ToString();
         }
     }
 

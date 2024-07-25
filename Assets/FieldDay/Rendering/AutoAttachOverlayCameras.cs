@@ -5,6 +5,7 @@
 using BeauUtil;
 using UnityEngine;
 using System;
+using BeauUtil.Debugger;
 
 #if USE_URP
 using UnityEngine.Rendering.Universal;
@@ -19,7 +20,8 @@ namespace FieldDay.Rendering {
     /// <summary>
     /// Automatically attaches overlay cameras to this camera.
     /// </summary>
-    [RequireComponent(typeof(Camera)), ExecuteAlways]
+    [DisallowMultipleComponent, RequireComponent(typeof(Camera)), ExecuteAlways]
+    [AddComponentMenu("Field Day/Cameras/Auto Attach Overlays")]
     public sealed class AutoAttachOverlayCameras : MonoBehaviour {
         [SerializeField, UnityTag] private string[] m_Tags = Array.Empty<string>();
         [NonSerialized] private readonly RingBuffer<Camera> m_CachedAddedCameras = new RingBuffer<Camera>();
@@ -48,6 +50,8 @@ namespace FieldDay.Rendering {
                     m_CachedAddedCameras.PushBack(cam);
                 }
             }
+#else
+            Log.Warn("[AutoAttachOverlayCameras] URP not detected - overlay cameras cannot be attached");
 #endif // USE_URP
         }
 
@@ -66,6 +70,16 @@ namespace FieldDay.Rendering {
                 stack.Remove(overlay);
             }
 #endif // USE_URP
+        }
+
+        public void OverrideTags(string[] tags) {
+            if (isActiveAndEnabled) {
+                enabled = false;
+                m_Tags = tags ?? Array.Empty<string>();
+                enabled = true;
+            } else {
+                m_Tags = tags ?? Array.Empty<string>();
+            }
         }
     }
 }

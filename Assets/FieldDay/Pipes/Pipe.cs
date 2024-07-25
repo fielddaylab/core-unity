@@ -1,5 +1,3 @@
-using System.Collections;
-using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using BeauUtil;
 
@@ -34,14 +32,18 @@ namespace FieldDay.Pipes {
         /// Attempts to peek at the next value in the pipe.
         /// </summary>
         bool TryPeek(out T value);
+
+        /// <summary>
+        /// Clears all values from the pipe.
+        /// </summary>
+        void Clear();
     }
 
     //public struct UnsafePipe<T> : IPipe<T> where T : unmanaged {
     //    private UnsafeSpan<T> m_Data;
 
     //    public UnsafeSpan<T> GetBuffer() {
-    //        // TODO: implement
-    //        return default;
+    //        return m_Data;
     //    }
     //}
 
@@ -53,6 +55,10 @@ namespace FieldDay.Pipes {
 
         public Pipe(int capacity, bool flexible) {
             m_Data = new RingBuffer<T>(capacity, flexible ? RingBufferMode.Expand : RingBufferMode.Fixed);
+        }
+
+        public Pipe(RingBuffer<T> data) {
+            m_Data = data;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -85,6 +91,11 @@ namespace FieldDay.Pipes {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool TryPeek(out T value) {
             return m_Data.TryPeekFront(out value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Clear() {
+            m_Data.Clear();
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

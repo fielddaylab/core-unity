@@ -12,6 +12,7 @@ using BeauUtil.Debugger;
 using UnityEngine;
 using UnityEngine.Scripting;
 using System.IO;
+using FieldDay.Debugging;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -85,7 +86,6 @@ namespace FieldDay.Data {
             if (!field.IsStatic) {
                 throw new ArgumentException(string.Format("Non-static field '{0}::{1}' cannot be used as a config var", field.DeclaringType.FullName, field.Name));
             }
-            Assert.True(field.IsStatic, "Cannot bind non-static config vars");
             m_ProgrammerDefault = field.GetValue(null);
             m_ActiveDefault = m_ProgrammerDefault;
 
@@ -185,6 +185,40 @@ namespace FieldDay.Data {
 
         #region Debug Menu
 
+#if DEVELOPMENT
+
+        [DebugMenuFactory]
+        static private DMInfo DebugMenuFactory() {
+            // config vars
+            DMInfo configVarMenu = new DMInfo("Config Vars", 8);
+
+            configVarMenu.AddButton("Save Changes", ConfigVar.WriteUserToPlayerPrefs);
+            configVarMenu.AddButton("Reload Changes", ConfigVar.ReadUserFromPlayerPrefs, ConfigVar.HasUserPrefs);
+            configVarMenu.AddDivider();
+
+            configVarMenu.AddButton("Commit Changes", ConfigVar.WriteAllToResources, () => Application.isEditor);
+            configVarMenu.AddButton("Reset (Committed)", () => ConfigVar.Reset(ConfigVar.AllVars));
+            configVarMenu.AddButton("Reset (Programmer)", () => ConfigVar.ProgrammerReset(ConfigVar.AllVars));
+            configVarMenu.AddDivider();
+
+            configVarMenu.AddDivider();
+
+            string currentCategory = null;
+            DMInfo categoryMenu = null;
+            foreach (var cvar in ConfigVar.AllVars) {
+                if (cvar.Category != currentCategory) {
+                    currentCategory = cvar.Category;
+                    categoryMenu = DMInfo.FindOrCreateSubmenu(configVarMenu, currentCategory);
+                }
+
+                ConfigVar.CreateDebugMenu(categoryMenu, cvar);
+            }
+
+            return configVarMenu;
+        }
+
+#endif // DEVELOPMENT
+
         /// <summary>
         /// Creates a debug menu for the given config variable.
         /// </summary>
@@ -224,7 +258,7 @@ namespace FieldDay.Data {
                         if (idx < 0 || idx >= cvar.m_EnumInfo.Values.Length) {
                             return string.Empty;
                         } else {
-                            return cvar.m_EnumInfo.Names[idx];
+                            return cvar.m_EnumInfo.InspectorNames[idx];
                         }
                     }, predicate, indent);
                     break;
@@ -405,7 +439,7 @@ namespace FieldDay.Data {
             List<ConfigVar> list = new List<ConfigVar>(512);
             foreach(var kv in ReflectionBootData.GetAllConfigVars()) {
                 try {
-                    kv.Attribute.Bind(kv.Info);
+                    kv.Attribute.Bind((FieldInfo) kv.Info);
                     list.Add(kv.Attribute);
                 } catch(Exception e) {
                     UnityEngine.Debug.LogException(e);

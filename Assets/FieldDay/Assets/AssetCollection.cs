@@ -11,8 +11,11 @@ using Unity.IL2CPP.CompilerServices;
 
 namespace FieldDay.Assets {
     internal interface IAssetCollection {
+        void Register(StringHash32 id, object asset);
+        void Deregister(StringHash32 id);
         object Lookup(StringHash32 id);
         void Clear();
+        IEnumerable GetAll();
     }
 
     internal class AssetCollection<T> : IAssetCollection {
@@ -46,6 +49,13 @@ namespace FieldDay.Assets {
         [Il2CppSetOption(Option.NullChecks, false)]
         public bool TryLookup(StringHash32 id, out T asset) {
             return m_Lookup.TryGetValue(id, out asset);
+        }
+
+        /// <summary>
+        /// Gets all the assets of this type.
+        /// </summary>
+        public Dictionary<StringHash32, T>.ValueCollection GetAll() {
+            return m_Lookup.Values;
         }
 
         #region Modifications
@@ -91,8 +101,16 @@ namespace FieldDay.Assets {
 
         #region IAssetCollection
 
+        void IAssetCollection.Register(StringHash32 id, object asset) {
+            Register(id, (T) asset);
+        }
+
         object IAssetCollection.Lookup(StringHash32 id) {
             return Lookup(id);
+        }
+        
+        IEnumerable IAssetCollection.GetAll() {
+            return GetAll();
         }
 
         #endregion // IAssetCollection

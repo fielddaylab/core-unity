@@ -8,7 +8,7 @@
       "url": "https://package.openupm.com"
     },
     "com.beauprime.beaupools": {
-      "version": "0.2.3",
+      "version": "0.3.1",
       "depth": 0,
       "source": "registry",
       "dependencies": {},
@@ -29,14 +29,14 @@
       "url": "https://package.openupm.com"
     },
     "com.beauprime.beauutil": {
-      "version": "0.10.0",
+      "version": "0.10.8",
       "depth": 0,
       "source": "registry",
       "dependencies": {},
       "url": "https://package.openupm.com"
     },
     "com.beauprime.tinyil-mono": {
-      "version": "0.1.1",
+      "version": "0.2.1",
       "depth": 0,
       "source": "registry",
       "dependencies": {
@@ -82,7 +82,7 @@
       "url": "https://packages.unity.com"
     },
     "com.unity.ide.visualstudio": {
-      "version": "2.0.18",
+      "version": "2.0.22",
       "depth": 0,
       "source": "registry",
       "dependencies": {
@@ -140,7 +140,7 @@
       "url": "https://packages.unity.com"
     },
     "com.unity.textmeshpro": {
-      "version": "3.0.6",
+      "version": "3.0.8",
       "depth": 0,
       "source": "registry",
       "dependencies": {

@@ -3,6 +3,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 
 namespace FieldDay {
     /// <summary>
@@ -14,7 +15,7 @@ namespace FieldDay {
         /// </summary>
         public struct EnumInfoCache {
             public object[] Values;
-            public string[] Names;
+            public string[] InspectorNames;
         }
 
         static private readonly Dictionary<Type, EnumInfoCache> s_CachedEnumInfo = new Dictionary<Type, EnumInfoCache>(4);
@@ -63,7 +64,7 @@ namespace FieldDay {
                 }
 
                 cache.Values = values.ToArray();
-                cache.Names = names.ToArray();
+                cache.InspectorNames = names.ToArray();
                 s_CachedEnumInfo.Add(enumType, cache);
             }
             return cache;
@@ -108,84 +109,97 @@ namespace FieldDay {
             return new string(buff, 0, charsWritten);
         }
 
+        /// <summary>
+        /// Returns the analytics-style name for the given name.
+        /// This makes all characters uppercase and places underscores
+        /// where word breaks would occur in the original string.
+        /// </summary>
+        static public unsafe string AnalyticsNameUpper(string name) {
+            char* buff = stackalloc char[name.Length * 2];
+            bool wasUpper = true, isUpper;
+            int charsWritten = 0;
+
+            int i = 0;
+            if (name.Length > 1) {
+                char first = name[0];
+                if (first == '_') {
+                    i = 1;
+                } else if (first == 'm' || first == 's' || first == 'k') {
+                    char second = name[1];
+                    if (second == '_' || char.IsUpper(second)) {
+                        i = 2;
+                    }
+                }
+            }
+
+            for (; i < name.Length; i++) {
+                char c = name[i];
+                isUpper = char.IsUpper(c);
+                if (char.IsWhiteSpace(c)) {
+                    buff[charsWritten++] = '_';
+                } else {
+                    if (isUpper && !wasUpper && charsWritten > 0) {
+                        buff[charsWritten++] = '_';
+                    }
+                    buff[charsWritten++] = StringUtils.ToUpperInvariant(c);
+                }
+
+                wasUpper = isUpper;
+            }
+
+            return new string(buff, 0, charsWritten);
+        }
+
+        /// <summary>
+        /// Returns the analytics-style name for the given name.
+        /// This formats similarly to InspectorName but without spaces
+        /// </summary>
+        static public unsafe string AnalyticsNamePascal(string name) {
+            char* buff = stackalloc char[name.Length * 2];
+            bool wasUpper = true, isUpper;
+            int charsWritten = 0;
+
+            int i = 0;
+            if (name.Length > 1) {
+                char first = name[0];
+                if (first == '_') {
+                    i = 1;
+                } else if (first == 'm' || first == 's' || first == 'k') {
+                    char second = name[1];
+                    if (second == '_' || char.IsUpper(second)) {
+                        i = 2;
+                    }
+                }
+            }
+
+            for (; i < name.Length; i++) {
+                char c = name[i];
+                isUpper = char.IsUpper(c);
+                //if (isUpper && !wasUpper && charsWritten > 0) {
+                //    buff[charsWritten++] = ' ';
+                //}
+                if (!char.IsWhiteSpace(c)) {
+                    buff[charsWritten++] = c;
+                }
+
+                wasUpper = isUpper;
+            }
+
+            return new string(buff, 0, charsWritten);
+        }
+
         #endregion // String
     }
 
-    /// <summary>
-    /// Attribute enumerator.
-    /// </summary>
-    public struct AttributeEnumerable<TAttr, TInfo> : IEnumerable<AttributeBinding<TAttr, TInfo>>, IEnumerator<AttributeBinding<TAttr, TInfo>>, IDisposable
-        where TAttr : Attribute
-        where TInfo : MemberInfo {
+    public struct EnumStringTable<T> where T : unmanaged, Enum {
+        public readonly string[] Strings;
 
-        private IEnumerator<AttributeBinding<TAttr, TInfo>> m_Native;
-        private IEnumerator<SerializedAttributeSet.AttributePair<TAttr>> m_FromSet;
-
-        public AttributeEnumerable(IEnumerable<AttributeBinding<TAttr, TInfo>> enumerable) {
-            m_Native = enumerable.GetEnumerator();
-            m_FromSet = null;
+        /// <summary>
+        /// 
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public string Get(T value) {
+            return Strings[Enums.ToInt(value)] ?? value.ToString();
         }
-
-        public AttributeEnumerable(IEnumerable<SerializedAttributeSet.AttributePair<TAttr>> enumerable) {
-            m_Native = null;
-            m_FromSet = enumerable.GetEnumerator();
-        }
-
-        #region Disposable
-
-        public void Dispose() {
-            (m_Native as IDisposable)?.Dispose();
-            (m_FromSet as IDisposable)?.Dispose();
-
-            m_Native = null;
-            m_FromSet = null;
-        }
-
-        #endregion // Disposable
-
-        #region Enumerable
-
-        public AttributeEnumerable<TAttr, TInfo> GetEnumerator() {
-            return this;
-        }
-
-        IEnumerator<AttributeBinding<TAttr, TInfo>> IEnumerable<AttributeBinding<TAttr, TInfo>>.GetEnumerator() {
-            return this;
-        }
-
-        IEnumerator IEnumerable.GetEnumerator() {
-            return this;
-        }
-
-        #endregion // Enumerable
-
-        #region Enumerator
-
-        public AttributeBinding<TAttr, TInfo> Current {
-            get {
-                if (m_Native != null) {
-                    return m_Native.Current;
-                } else {
-                    return new AttributeBinding<TAttr, TInfo>(m_FromSet.Current.Attribute, (TInfo) m_FromSet.Current.Info);
-                }
-            }
-        }
-
-        object IEnumerator.Current { get { return Current; } }
-
-        public bool MoveNext() {
-            if (m_Native != null) {
-                return m_Native.MoveNext();
-            } else {
-                return m_FromSet.MoveNext();
-            }
-        }
-
-        public void Reset() {
-            m_Native?.Reset();
-            m_FromSet?.Reset();
-        }
-
-        #endregion // Enumerator
     }
 }
