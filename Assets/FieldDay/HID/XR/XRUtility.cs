@@ -6,6 +6,7 @@ using System;
 using System.Runtime.CompilerServices;
 using BeauUtil.Debugger;
 using UnityEngine;
+using System.Reflection;
 
 #if USING_XR && !UNITY_WEBGL
 using UnityEngine.XR;
@@ -303,6 +304,48 @@ namespace FieldDay.HID.XR {
         }
 
         #endregion // Head State
+
+        #region Refresh Rate
+
+        /// <summary>
+        /// Attempts to set the refresh rate of the headset.
+        /// </summary>
+        static public void SetRefreshRate(float desiredRefreshRate) {
+#if USING_OCULUSXR
+            if (Unity.XR.Oculus.Performance.TrySetDisplayRefreshRate(desiredRefreshRate)) {
+                Log.Msg("[XRUtility] Set refresh rate to {0}hZ", desiredRefreshRate);
+            } else {
+                Log.Warn("[XRUtility] Unable to set refresh rate to {0}hZ", desiredRefreshRate);
+            }
+#endif // USING_OCULUSXR
+        }
+
+        #endregion // Refresh Rate
+
+        #region Devices
+
+        /// <summary>
+        /// Gets the input device for the given hand.
+        /// </summary>
+        static public InputDevice GetHand(XRHandIndex hand) {
+            return InputDevices.GetDeviceAtXRNode(HandIndexToNode(hand));
+        }
+
+        /// <summary>
+        /// Maps a hand index to an XRNode
+        /// </summary>
+        static internal XRNode HandIndexToNode(XRHandIndex index) {
+            switch (index) {
+                case XRHandIndex.Left:
+                    return XRNode.LeftHand;
+                case XRHandIndex.Right:
+                    return XRNode.RightHand;
+                default:
+                    return (XRNode) (-1);
+            }
+        }
+
+        #endregion // Devices
 
 #endif // USING_XR && !UNITY_WEBGL
     }

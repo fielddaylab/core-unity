@@ -214,18 +214,42 @@ namespace ScriptableBake {
 
         #region Prefabs
 
-        // static public IEnumerator PrefabsAsync(string[] directories, BakeFlags flags = 0) {
-        //     string[] guids;
-        //     if (directories != null && directories.Length > 0) {
-        //         guids = AssetDatabase.FindAssets("t:Prefab", directories);
-        //     } else {
-        //         guids = AssetDatabase.FindAssets("t:Prefab");
-        //     }
-        // }
-
         #endregion // Prefabs
 
         #region Hierarchy
+
+        /// <summary>
+        /// Bakes all components in a given hierarchy.
+        /// </summary>
+        static public void BakeHierarchy(GameObject root, BakeFlags flags = 0) {
+            IEnumerator iter = BakeHierarchyAsync(root, flags);
+            using (iter as IDisposable) {
+                while (iter.MoveNext())
+                    ;
+            }
+        }
+
+        /// <summary>
+        /// Bakes all components in a given hierarchy asynchronously.
+        /// Use this in a coroutine.
+        /// </summary>
+        static public IEnumerator BakeHierarchyAsync(GameObject root, BakeFlags flags = 0) {
+            bool bIgnoreDisabled = (flags & BakeFlags.IgnoreDisabledObjects) != 0;
+
+            List<IBaked> rootBaked = new List<IBaked>(16);
+            root.GetComponentsInChildren<IBaked>(!bIgnoreDisabled, rootBaked);
+
+            BakeContext context = new BakeContext();
+            context.Scene = SceneManager.GetActiveScene();
+            context.MainCamera = FindMainCamera();
+            context.HasFog = RenderSettings.fog;
+            if (context.HasFog) {
+                context.FogStartDistance = RenderSettings.fogStartDistance;
+                context.FogEndDistance = RenderSettings.fogEndDistance;
+            }
+            context.m_Flags = flags;
+            return Process(rootBaked, "Hierarchy", flags, context, null);
+        }
 
         // Brought over from BeauUtil
 
@@ -258,8 +282,10 @@ namespace ScriptableBake {
                 if ((flags & FlattenFlags.DestroyInactive) != 0 && !child.gameObject.activeSelf) {
                     GameObject.DestroyImmediate(child.gameObject);
                 } else {
+                    child.GetPositionAndRotation(out Vector3 p, out Quaternion q);
                     child.SetParent(parent, true);
                     child.SetSiblingIndex(siblingIdx++);
+                    child.SetPositionAndRotation(p, q);
                 }
             }
         }
@@ -282,8 +308,10 @@ namespace ScriptableBake {
                 if ((flags & FlattenFlags.DestroyInactive) != 0 && !child.gameObject.activeSelf) {
                     GameObject.DestroyImmediate(child.gameObject);
                 } else {
+                    child.GetPositionAndRotation(out Vector3 p, out Quaternion q);
                     child.SetParent(parent, true);
                     child.SetSiblingIndex(siblingIndex++);
+                    child.SetPositionAndRotation(p, q);
                     FlattenHierarchyRecursive(child, parent, flags, ref siblingIndex);
                 }
             }
@@ -295,16 +323,21 @@ namespace ScriptableBake {
         /// Returns if the given Transform is a leaf node in its transform hierarchy,
         /// and has no non-transform components.
         /// </summary>
-        static public bool IsEmptyLeaf(Transform transform) {
+        static public bool IsEmptyLeaf(Transform transform, int expectedComponentCount = 0) {
             if (transform.childCount > 0) {
                 return false;
             }
 
             List<Component> tempList = s_CachedComponentList ?? (s_CachedComponentList = new List<Component>(4));
             transform.gameObject.GetComponents<Component>(tempList);
-            int count = tempList.Count;
+            int count = 0;
+            foreach(var c in tempList) {
+                if (c) {
+                    count++;
+                }
+            }
             tempList.Clear();
-            return count == 1; // transform is included, so must be more than 1
+            return count <= 1 + expectedComponentCount; // transform is included, so must be more than 1
         }
 
         /// <summary>
@@ -333,6 +366,18 @@ namespace ScriptableBake {
             for(int i = 0; i < childCount; i++) {
                 DeepHierarchyExplore(root.GetChild(i), found);
             }
+        }
+
+        /// <summary>
+        /// Unpacks the root prefab instance of the given transform.
+        /// </summary>
+        static public bool UnpackPrefabIfNecessary(Transform transform) {
+            GameObject root = PrefabUtility.GetOutermostPrefabInstanceRoot(transform);
+            if (root != null) {
+                PrefabUtility.UnpackPrefabInstance(root, PrefabUnpackMode.Completely, InteractionMode.AutomatedAction);
+                return true;
+            }
+            return false;
         }
 
         #endregion // Hierarchy
@@ -464,11 +509,19 @@ namespace ScriptableBake {
         /// <summary>
         /// Destroys an object.
         /// </summary>
-        static public void Destroy(UnityEngine.Object obj) {
+        static public void Destroy(UnityEngine.Object obj, bool forceImmediate = false) {
             if (obj is Transform) {
                 obj = ((Transform) obj).gameObject;
             }
-            if (!Application.isPlaying) {
+
+            bool sceneIsLoading = false;
+            if (obj is GameObject) {
+                sceneIsLoading = !((GameObject) obj).scene.isLoaded;
+            } else if (obj is Component) {
+                sceneIsLoading = !((Component) obj).gameObject.scene.isLoaded;
+            }
+
+            if (forceImmediate || !Application.isPlaying || sceneIsLoading) {
                 if (obj is GameObject) {
                     GameObject prefabRoot = PrefabUtility.GetOutermostPrefabInstanceRoot(obj);
                     if (prefabRoot != null) {
@@ -650,6 +703,28 @@ namespace ScriptableBake {
             return output;
         }
 
+        /// <summary>
+        /// Finds all TextAssets with the given extension in the given directories.
+        /// </summary>
+        static public TextAsset[] FindTextAssets(string extension, params string[] directories) {
+            HashSet<TextAsset> found = new HashSet<TextAsset>();
+            foreach (var path in AssetPaths(SearchFilter(typeof(TextAsset)), directories)) {
+                if (!path.EndsWith(extension))
+                    continue;
+
+                foreach (var obj in AssetDatabase.LoadAllAssetsAtPath(path)) {
+                    TextAsset asset = obj as TextAsset;
+                    if (asset) {
+                        found.Add(asset);
+                    }
+                }
+            }
+
+            TextAsset[] output = new TextAsset[found.Count];
+            found.CopyTo(output);
+            return output;
+        }
+
         #endregion // Assets
 
         #region Scenes
@@ -735,6 +810,36 @@ namespace ScriptableBake {
         }
 
         #endregion // Prefabs
+
+        #region In Scene
+
+        /// <summary>
+        /// Returns the currently loaded component that passes the given predicate.
+        /// </summary>
+        static public T FindComponent<T>(Predicate<T> predicate) where T : UnityEngine.Component {
+            var objects = GameObject.FindObjectsByType(typeof(T), FindObjectsInactive.Include, FindObjectsSortMode.None);
+            for(int i = 0; i < objects.Length; i++) {
+                if (predicate((T) objects[i])) {
+                    return (T) objects[i];
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Returns the currently loaded component that passes the given predicate.
+        /// </summary>
+        static public T FindComponent<T, U>(Func<T, U, bool> predicate, in U predicateArg) where T : UnityEngine.Component {
+            var objects = GameObject.FindObjectsByType(typeof(T), FindObjectsInactive.Include, FindObjectsSortMode.None);
+            for (int i = 0; i < objects.Length; i++) {
+                if (predicate((T) objects[i], predicateArg)) {
+                    return (T) objects[i];
+                }
+            }
+            return null;
+        }
+
+        #endregion // In Scene
 
         static private IEnumerable<string> AssetPaths(string filter) {
             string[] guids = AssetDatabase.FindAssets(filter);
@@ -1034,6 +1139,7 @@ namespace ScriptableBake {
 
         internal BakeFlags m_Flags;
         private Dictionary<string, object> m_ValueCache;
+        private ulong m_ComponentTypeFlags;
         internal List<IBaked> m_AdditionalBakeQueue; 
 
         /// <summary>

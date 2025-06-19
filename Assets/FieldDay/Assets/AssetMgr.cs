@@ -4,12 +4,15 @@ using System.Runtime.CompilerServices;
 using BeauUtil;
 using BeauUtil.Debugger;
 using Unity.IL2CPP.CompilerServices;
+using System.Collections;
+using BeauUtil.IO;
+using UnityEngine;
+using BeauPools;
 
 using GlobalAssetIndex = BeauUtil.TypeIndex<FieldDay.Assets.IGlobalAsset>;
 using LiteAssetIndex = BeauUtil.TypeIndex<FieldDay.Assets.ILiteAsset>;
 using NamedAssetIndex = BeauUtil.TypeIndex<FieldDay.Assets.INamedAsset>;
 using NamedAssetCollection = FieldDay.Assets.AssetCollection<FieldDay.Assets.INamedAsset>;
-using System.Collections;
 
 namespace FieldDay.Assets {
     /// <summary>
@@ -20,10 +23,24 @@ namespace FieldDay.Assets {
         private readonly IAssetCollection[] m_LiteAssetTable = new IAssetCollection[LiteAssetIndex.Capacity];
         private readonly NamedAssetCollection[] m_NamedAssetTable = new NamedAssetCollection[NamedAssetIndex.Capacity];
         private readonly HashSet<IAssetPackage> m_LoadedPackages = new HashSet<IAssetPackage>(16);
+        private readonly RingBuffer<IAssetPackage> m_UnloadQueue = new RingBuffer<IAssetPackage>(16, RingBufferMode.Expand);
+
+        private readonly CastableAction<INamedAsset>[] m_NamedAssetPostLoadCallbackTable = new CastableAction<INamedAsset>[NamedAssetIndex.Capacity];
+        private readonly CastableAction<INamedAsset>[] m_NamedAssetUnloadCallbackTable = new CastableAction<INamedAsset>[NamedAssetIndex.Capacity];
+
+        private readonly HotReloadBatcher m_ReloadBatcher = new HotReloadBatcher();
 
         #region Events
 
+        internal void Update() {
+            if (IsSafeToUnloadPackages()) {
+                ProcessQueuedPackageUnloads();
+            }
+        }
+
         internal void Shutdown() {
+            ProcessQueuedPackageUnloads();
+
             for (int i = 0; i < LiteAssetIndex.Count; i++) {
                 if (m_LiteAssetTable[i] != null) {
                     m_LiteAssetTable[i].Clear();
@@ -45,6 +62,17 @@ namespace FieldDay.Assets {
             Array.Clear(m_LiteAssetTable, 0, m_LiteAssetTable.Length);
             Array.Clear(m_NamedAssetTable, 0, m_NamedAssetTable.Length);
             Array.Clear(m_GlobalAssetTable, 0, m_GlobalAssetTable.Length);
+        }
+
+        private bool IsSafeToUnloadPackages() {
+            if (Game.Files.AnyHighPriorityRequestsLoading()) {
+                return false;
+            }
+            if (!Game.Scenes.IsSafeToUnloadAssets()) {
+                return false;
+            }
+
+            return true;
         }
 
         #endregion // Events
@@ -101,11 +129,12 @@ namespace FieldDay.Assets {
 
             Type assetType = asset.GetType();
             var typeIndices = NamedAssetIndex.GetAll(assetType);
-            foreach(var index in typeIndices) {
+            foreach (var index in typeIndices) {
                 GetNamedCollection(index, true).Register(id, asset);
             }
 
             RegistrationCallbacks.InvokeRegister(asset);
+            InvokeNamedCallbacks(m_NamedAssetPostLoadCallbackTable, assetType, asset);
             Log.Msg("[AssetMgr] Named asset '{0}' of type '{1}' registered", id.ToDebugString(), assetType.FullName);
         }
 
@@ -122,6 +151,7 @@ namespace FieldDay.Assets {
                 GetNamedCollection(index, false)?.Deregister(id);
             }
 
+            InvokeNamedCallbacks(m_NamedAssetUnloadCallbackTable, assetType, asset);
             RegistrationCallbacks.InvokeDeregister(asset);
             Log.Msg("[AssetMgr] Named asset '{0}' of type '{1}' deregistered", id.ToDebugString(), assetType.FullName);
         }
@@ -134,7 +164,12 @@ namespace FieldDay.Assets {
         /// Loads the given package into the asset manager.
         /// </summary>
         public void LoadPackage(IAssetPackage package) {
-            if (!m_LoadedPackages.Add(package)) {
+            if (!AssetUtility.AddReference(package) || !m_LoadedPackages.Add(package)) {
+                return;
+            }
+
+            if (m_UnloadQueue.FastRemove(package)) {
+                Log.Msg("[AssetMgr] Package '{0}' unload cancelled", AssetUtility.NameOf(package));
                 return;
             }
 
@@ -147,13 +182,20 @@ namespace FieldDay.Assets {
         /// Unloads the given package from the asset manager.
         /// </summary>
         public void UnloadPackage(IAssetPackage package) {
-            if (!m_LoadedPackages.Remove(package)) {
+            if (!AssetUtility.RemoveReference(package) || !m_LoadedPackages.Remove(package)) {
                 return;
             }
 
-            Log.Msg("[AssetMgr] Unloading package '{0}'...", AssetUtility.NameOf(package));
-            package.Unmount(this);
-            Log.Msg("[AssetMgr] ...finished unloading package '{0}'", AssetUtility.NameOf(package));
+            Log.Msg("[AssetMgr] Package '{0}' queued to unload", AssetUtility.NameOf(package));
+            m_UnloadQueue.PushBack(package);
+        }
+
+        private void ProcessQueuedPackageUnloads() {
+            while(m_UnloadQueue.TryPopFront(out IAssetPackage package)) {
+                Log.Msg("[AssetMgr] Unloading package '{0}'...", AssetUtility.NameOf(package));
+                package.Unmount(this);
+                Log.Msg("[AssetMgr] ...finished unloading package '{0}'", AssetUtility.NameOf(package));
+            }
         }
 
         #endregion // Packages
@@ -189,7 +231,7 @@ namespace FieldDay.Assets {
                 throw new ArgumentNullException("keyFunc");
             }
             AssetCollection<T> typedCollection = GetLiteCollection<T>(true);
-            foreach(var asset in data) {
+            foreach (var asset in data) {
                 typedCollection.Register(keyFunc(asset), asset);
             }
         }
@@ -211,7 +253,7 @@ namespace FieldDay.Assets {
             }
             AssetCollection<T> typedCollection = GetLiteCollection<T>(false);
             if (typedCollection != null) {
-                for(int i = 0; i < data.Length; i++) {
+                for (int i = 0; i < data.Length; i++) {
                     typedCollection.Deregister(keyFunc(data[i]));
                 }
             }
@@ -245,6 +287,8 @@ namespace FieldDay.Assets {
         /// This will assert if none is found.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [Il2CppSetOption(Option.ArrayBoundsChecks, false)]
+        [Il2CppSetOption(Option.NullChecks, false)]
         public IGlobalAsset GetGlobal(Type type) {
             int index = GlobalAssetIndex.Get(type);
             IGlobalAsset asset = m_GlobalAssetTable[index];
@@ -261,6 +305,8 @@ namespace FieldDay.Assets {
         /// This will assert if none is found.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [Il2CppSetOption(Option.ArrayBoundsChecks, false)]
+        [Il2CppSetOption(Option.NullChecks, false)]
         public T GetGlobal<T>() where T : class, IGlobalAsset {
             int index = GlobalAssetIndex.Get<T>();
             IGlobalAsset asset = m_GlobalAssetTable[index];
@@ -269,7 +315,7 @@ namespace FieldDay.Assets {
                 Assert.Fail("No global asset found for type '{0}'", typeof(T).FullName);
             }
 #endif // DEVELOPMENT
-            return (T) asset;
+            return Unsafe.FastCast<T>(asset);
         }
 
         /// <summary>
@@ -299,10 +345,11 @@ namespace FieldDay.Assets {
         /// <summary>
         /// Looks up the named asset with the given id.
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         [Il2CppSetOption(Option.NullChecks, false)]
         public T GetNamed<T>(StringHash32 id) where T : class, INamedAsset {
             NamedAssetCollection typedCollection = GetNamedCollection<T>(true);
-            return (T) typedCollection.Lookup(id);
+            return Unsafe.FastCast<T>(typedCollection.Lookup<T>(id));
         }
 
         /// <summary>
@@ -312,7 +359,7 @@ namespace FieldDay.Assets {
         public bool TryGetNamed<T>(StringHash32 id, out T asset) where T : class, INamedAsset {
             NamedAssetCollection typedCollection = GetNamedCollection<T>(true);
             bool found = typedCollection.TryLookup(id, out INamedAsset interfaceAsset);
-            asset = (T) interfaceAsset;
+            asset = Unsafe.FastCast<T>(interfaceAsset);
             return found;
         }
 
@@ -322,6 +369,15 @@ namespace FieldDay.Assets {
         public NamedAssetIterator<T> GetAllNamed<T>() where T : class, INamedAsset {
             NamedAssetCollection typedCollection = GetNamedCollection<T>(true);
             return new NamedAssetIterator<T>(typedCollection.GetAll());
+        }
+
+        /// <summary>
+        /// Returns if a named asset with the given name and type is loaded.
+        /// </summary>
+        [Il2CppSetOption(Option.NullChecks, false)]
+        public bool HasNamed<T>(StringHash32 id) where T : class, INamedAsset {
+            NamedAssetCollection typedCollection = GetNamedCollection<T>(true);
+            return typedCollection.TryLookup(id, out var _);
         }
 
         #endregion // Named
@@ -402,6 +458,109 @@ namespace FieldDay.Assets {
         }
 
         #endregion // Internal
+
+        #region Callbacks
+
+        /// <summary>
+        /// Sets load and unload handlers for a given asset type.
+        /// </summary>
+        public void SetNamedAssetLoadCallbacks<T>(Action<T> onLoad, Action<T> onUnload) where T : INamedAsset {
+            int index = NamedAssetIndex.Get<T>();
+            if (onLoad != null) {
+                m_NamedAssetPostLoadCallbackTable[index] = CastableAction<INamedAsset>.Create(onLoad);
+            } else {
+                m_NamedAssetPostLoadCallbackTable[index] = default;
+            }
+
+            if (onUnload != null) {
+                m_NamedAssetUnloadCallbackTable[index] = CastableAction<INamedAsset>.Create(onUnload);
+            } else {
+                m_NamedAssetUnloadCallbackTable[index] = default;
+            }
+        }
+
+        static private void InvokeNamedCallbacks(CastableAction<INamedAsset>[] assets, Type assetType, INamedAsset asset) {
+            var typeIndices = NamedAssetIndex.GetAll(assetType);
+            foreach (var index in typeIndices) {
+                var action = assets[index];
+                if (!action.IsEmpty) {
+                    action.Invoke(asset);
+                }
+            }
+        }
+
+        #endregion // Callbacks
+
+        #region Hot Reload
+
+        /// <summary>
+        /// Registers a hot-reloadable asset.
+        /// </summary>
+        public void RegisterHotReloadable(IHotReloadable reloadable) {
+            if (m_ReloadBatcher.Add(reloadable)) {
+                Log.Debug("[AssetMgr] Registered hot-reloadable asset '{0}'", reloadable.Id);
+            }
+        }
+
+        /// <summary>
+        /// Registers a hot-reloadable asset.
+        /// </summary>
+        public IHotReloadable RegisterHotReloadCallbacks<T>(T asset, HotReloadAssetDelegate<T> callback) where T : UnityEngine.Object {
+#if UNITY_EDITOR
+            if (asset != null && asset.IsPersistent()) {
+                var reloadable = new HotReloadableAssetProxy<T>(asset, callback);
+                RegisterHotReloadable(reloadable);
+                return reloadable;
+            } else {
+                return null;
+            }
+#else
+            return null;
+#endif // UNITY_EDITOR
+        }
+
+        /// <summary>
+        /// Registers a hot-reloadable asset.
+        /// </summary>
+        public void DeregisterHotReloadable(IHotReloadable reloadable) {
+            if (m_ReloadBatcher.Remove(reloadable)) {
+                Log.Debug("[AssetMgr] Unregistered hot-reloadable asset '{0}'", reloadable.Id);
+            }
+        }
+
+        private void TryHotReloadAll() {
+            using (var res = PooledSet<HotReloadResult>.Create()) {
+                m_ReloadBatcher.TryReloadAll(res, false);
+                LogHotReloadResults(res);
+            }
+        }
+
+        static private void LogHotReloadResults(ICollection<HotReloadResult> res) {
+            if (res.Count > 0) {
+                using (var str = PooledStringBuilder.Create(1024)) {
+                    str.Builder.Append("[AssetMgr] Hot-reloaded ").AppendNoAlloc(res.Count).Append(" assets");
+                    foreach (var result in res) {
+                        str.Builder.Append("\n - ").Append(result.ToDebugString());
+                    }
+                    Log.Msg(str.Builder.Flush());
+                }
+            } else {
+                Log.Trace("[AssetMgr] Hot-reloaded no assets");
+            }
+        }
+
+        #endregion // Hot Reload
+
+#if UNITY_EDITOR
+        private class EditorReloadCallback : UnityEditor.AssetPostprocessor {
+            static private void OnPostprocessAllAssets(string[] importedAssets, string[] deletedAssets, string[] movedAssets, string[] movedFromAssetPaths) {
+                if (!Application.isPlaying || Game.IsShuttingDown)
+                    return;
+
+                UnityEditor.EditorApplication.delayCall += () => Game.Assets.TryHotReloadAll();
+            }
+        }
+#endif // UNITY_EDITOR
     }
 
     /// <summary>
@@ -419,7 +578,7 @@ namespace FieldDay.Assets {
         }
 
         public T Current {
-            get { return (T) m_Source.Current; }
+            get { return Unsafe.FastCast<T>(m_Source.Current); }
         }
 
         public NamedAssetIterator<T> GetEnumerator() {

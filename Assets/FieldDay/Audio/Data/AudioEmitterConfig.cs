@@ -1,4 +1,5 @@
 using System;
+using BeauRoutine;
 using BeauUtil;
 using UnityEngine;
 
@@ -14,6 +15,8 @@ namespace FieldDay.Audio {
         /// </summary>
         [AutoEnum] public AudioEmitterMode Mode;
 
+        [Header("Attenuation")]
+
         /// <summary>
         /// Rolloff type.
         /// </summary>
@@ -21,10 +24,10 @@ namespace FieldDay.Audio {
         [AutoEnum] public AudioRolloffMode Rolloff;
 
         /// <summary>
-        /// Index of the custom rolloff curve.
+        /// Custom rolloff curve.
         /// </summary>
-        [Tooltip("Custom rolloff curve index")]
-        public int CustomRolloffCurveIndex;
+        [Tooltip("Custom rolloff curve")]
+        public AnimationCurve CustomRolloffCurve;
 
         /// <summary>
         /// Rolloff minimum distance.
@@ -38,6 +41,8 @@ namespace FieldDay.Audio {
         [Tooltip("Maximum rolloff distance")]
         [Range(0, 300)] public float MaxDistance;
 
+        [Header("Spatialization")]
+
         /// <summary>
         /// Factor by which the audio is "despatialized".
         /// </summary>
@@ -49,6 +54,8 @@ namespace FieldDay.Audio {
         /// </summary>
         [Range(0, 360)]
         public float Spread;
+
+        [Header("Effects")]
 
         /// <summary>
         /// Doppler level of sound.
@@ -92,6 +99,43 @@ namespace FieldDay.Audio {
             DopplerLevel = 1,
             ReverbZoneMix = 1,
         };
+
+        #region Utility
+
+        /// <summary>
+        /// Applies the given audio emitter configuration to the given audio source.
+        /// </summary>
+        static public void ApplyConfiguration(AudioSource source, in AudioEmitterConfig config, bool hasSpatializationPlugin) {
+            source.bypassListenerEffects = (config.EffectBypasses & AudioEmitterBypassFlags.ListenerEffects) != 0;
+            source.bypassReverbZones = (config.EffectBypasses & AudioEmitterBypassFlags.ReverbZones) != 0;
+            source.bypassEffects = (config.EffectBypasses & AudioEmitterBypassFlags.LocalEffects) != 0;
+
+            source.reverbZoneMix = config.ReverbZoneMix;
+
+            switch (config.Mode) {
+                case AudioEmitterMode.Fixed: {
+                    source.spatialBlend = 0;
+                    source.spatialize = false;
+                    break;
+                }
+
+                default: {
+                    source.dopplerLevel = config.DopplerLevel;
+                    source.spread = config.Spread;
+                    source.rolloffMode = config.Rolloff;
+                    if (config.Rolloff == AudioRolloffMode.Custom) {
+                        source.SetCustomCurve(AudioSourceCurveType.CustomRolloff, config.CustomRolloffCurve);
+                    }
+                    source.minDistance = config.MinDistance;
+                    source.maxDistance = config.MaxDistance;
+                    source.spatialBlend = 1 - config.DespatializeFactor;
+                    source.spatialize = hasSpatializationPlugin && (config.EffectBypasses & AudioEmitterBypassFlags.SpatializationPlugin) == 0;
+                    break;
+                }
+            }
+        }
+
+        #endregion // Utility
     }
 
     /// <summary>
@@ -101,7 +145,8 @@ namespace FieldDay.Audio {
     public enum AudioEmitterBypassFlags {
         LocalEffects = 0x01,
         ListenerEffects = 0x02,
-        ReverbZones = 0x04
+        ReverbZones = 0x04,
+        SpatializationPlugin = 0x08
     }
 
     /// <summary>
@@ -112,28 +157,28 @@ namespace FieldDay.Audio {
         [Label("Fixed (Not Spatial)")]
         Fixed,
 
-        [Label("2D (XY)")]
+        [Label("2D/XY")]
         Flat,
 
-        [Label("2D (XZ)")]
+        [Label("2D/XZ")]
         FlatXZ,
 
-        [Label("2D (YZ)")]
+        [Label("2D/YZ")]
         FlatYZ,
 
-        [Label("3D")]
+        [Label("3D/World")]
         World,
 
-        [Label("3D (Relative to Listener)")]
+        [Label("3D/Relative to Listener")]
         ListenerRelative,
 
-        [Label("Screen Space")]
+        [Label("2D/Screen Space")]
         ScreenSpace,
 
-        [Label("Custom A")]
+        [Label("Custom/A")]
         CustomA,
 
-        [Label("Custom B")]
+        [Label("Custom/B")]
         CustomB
     }
 }

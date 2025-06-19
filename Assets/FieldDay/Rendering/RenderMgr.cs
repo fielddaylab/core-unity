@@ -1,3 +1,7 @@
+#if (UNITY_EDITOR && !IGNORE_UNITY_EDITOR) || DEVELOPMENT_BUILD
+#define DEVELOPMENT
+#endif
+
 #if UNITY_2019_1_OR_NEWER
 #define USE_SRP
 #endif // UNITY_2019_1_OR_NEWER
@@ -123,6 +127,11 @@ namespace FieldDay.Rendering {
 
 #endif // DEVELOPMENT
 
+        public struct CameraChangeData {
+            public Camera Previous;
+            public Camera New;
+        }
+
         private bool m_LastKnownFullscreen;
         private Resolution m_LastKnownResolution;
 
@@ -155,6 +164,7 @@ namespace FieldDay.Rendering {
 
         public readonly CastableEvent<bool> OnFullscreenChanged = new CastableEvent<bool>(2);
         public readonly CastableEvent<Resolution> OnResolutionChanged = new CastableEvent<Resolution>(2);
+        public readonly CastableEvent<CameraChangeData> OnPrimaryCameraChanged = new CastableEvent<CameraChangeData>(2);
 
         #endregion // Callbacks
 
@@ -187,7 +197,13 @@ namespace FieldDay.Rendering {
             }
 
             Resolution resolution = ScreenUtility.GetResolution();
-            if (resolution.width != m_LastKnownResolution.width || resolution.height != m_LastKnownResolution.height || resolution.refreshRate != m_LastKnownResolution.refreshRate) {
+            if (resolution.width != m_LastKnownResolution.width || resolution.height != m_LastKnownResolution.height
+#if UNITY_2022_2_OR_NEWER
+                || !resolution.refreshRateRatio.Equals(m_LastKnownResolution.refreshRateRatio)
+#else
+                || resolution.refreshRate != m_LastKnownResolution.refreshRate
+#endif // UNITY_2022_2_OR_NEWER
+                ) {
                 m_LastKnownResolution = resolution;
                 OnResolutionChanged.Invoke(resolution);
             }
@@ -222,9 +238,17 @@ namespace FieldDay.Rendering {
             if (m_PrimaryCamera != null) {
                 Log.Warn("[RenderMgr] Primary world camera already set to '{0}' - make sure to deregister it first", m_PrimaryCamera);
             }
+            Camera old = m_PrimaryCamera;
             m_PrimaryCamera = camera;
             m_ShouldCheckFallback = true;
             Log.Msg("[RenderMgr] Assigned primary world camera as '{0}'", camera);
+
+            OnPrimaryCameraChanged.Invoke(new CameraChangeData() {
+                Previous = old,
+                New = camera
+            });
+
+            OnGuiCameraChanged(Game.Gui.PrimaryCamera);
         }
 
         public void RemovePrimaryCamera(Camera camera) {
@@ -232,9 +256,15 @@ namespace FieldDay.Rendering {
                 return;
             }
 
+            Camera old = m_PrimaryCamera;
             m_PrimaryCamera = null;
             m_ShouldCheckFallback = true;
             Log.Msg("[RenderMgr] Removed primary world camera");
+            
+            OnPrimaryCameraChanged.Invoke(new CameraChangeData() {
+                Previous = old,
+                New = null
+            });
         }
 
         #endregion // World Camera
@@ -336,18 +366,28 @@ namespace FieldDay.Rendering {
         #region Handlers
 
         private void OnGuiCameraChanged(Camera uiCam) {
-            if (!m_FallbackCamera) {
-                return;
-            }
 #if USING_URP
-            var data = m_FallbackCamera.GetUniversalAdditionalCameraData();
-            if (data) {
-                if (uiCam != null) {
-                    if (!data.cameraStack.Contains(uiCam)) {
-                        data.cameraStack.Add(uiCam);
+            if (m_FallbackCamera) {
+                var data = m_FallbackCamera.GetUniversalAdditionalCameraData();
+                if (data) {
+                    if (uiCam != null) {
+                        if (!data.cameraStack.Contains(uiCam)) {
+                            data.cameraStack.Add(uiCam);
+                        }
+                    } else {
+                        data.cameraStack.Clear();
                     }
-                } else {
-                    data.cameraStack.Clear();
+                }
+            }
+
+            if (m_PrimaryCamera && uiCam && uiCam.GetUniversalAdditionalCameraData().renderType == CameraRenderType.Overlay) {
+                var data = m_PrimaryCamera.GetUniversalAdditionalCameraData();
+                if (data) {
+                    if (uiCam != null) {
+                        if (!data.cameraStack.Contains(uiCam)) {
+                            data.cameraStack.Add(uiCam);
+                        }
+                    }
                 }
             }
 #endif // USING_URP
@@ -460,7 +500,7 @@ namespace FieldDay.Rendering {
             }
 #endif // DEVELOPMENT
 
-            AttemptRenderLetterboxing();
+            AttemptRenderLetterboxing(inCamera);
 
 #if DEVELOPMENT
             if (m_DebugPrimaryCameraRestore.CameraId == 0 && m_DebugPrimaryCameraAdjustments.CachedActive && ReferenceEquals(inCamera, m_PrimaryCamera)) {
@@ -495,16 +535,28 @@ namespace FieldDay.Rendering {
 #endif // DEVELOPMENT
         }
 
-        private void AttemptRenderLetterboxing() {
+        private void AttemptRenderLetterboxing(Camera camera) {
+            if (camera.targetTexture != null) {
+                return;
+            }
+
             if (m_LastLetterboxFrameRendered != Frame.Index) {
                 m_LastLetterboxFrameRendered = Frame.Index;
 
-                Graphics.SetRenderTarget(null);
+                RenderTexture prevRenderTarget = null;
+                bool switchedRenderTargets = false;
 
                 if (m_UsingFallback && !m_FallbackCamera) {
                     if (DebugFlags.IsFlagSet(DebuggingFlags.TraceExecution)) {
                         Log.Trace("[RenderMgr] Clearing backbuffer as fallback");
                     }
+
+                    if (!switchedRenderTargets) {
+                        switchedRenderTargets = true;
+                        prevRenderTarget = RenderTexture.active;
+                        Graphics.SetRenderTarget(null);
+                    }
+
                     GL.PushMatrix();
                     GL.LoadOrtho();
                     GL.Clear(true, true, Color.black, 1);
@@ -512,14 +564,29 @@ namespace FieldDay.Rendering {
                 }
 
                 if (m_HasLetterboxing && m_ClampedViewportCameras.Count > 0) {
+                    if (!switchedRenderTargets) {
+                        switchedRenderTargets = true;
+                        prevRenderTarget = RenderTexture.active;
+                        Graphics.SetRenderTarget(null);
+                    }
+
+                    GL.PushMatrix();
+                    GL.LoadOrtho();
                     GL.Viewport(new Rect(0, 0, m_LastKnownResolution.width, m_LastKnownResolution.height));
                     if (DebugFlags.IsFlagSet(DebuggingFlags.TraceExecution)) {
                         Log.Trace("[RenderMgr] Rendering letterboxing for viewport {0}", m_VirtualViewport.ToString());
                     }
                     CameraHelper.RenderLetterboxing(m_VirtualViewport, Color.black);
+                    GL.PopMatrix();
                 }
 
                 if (DebugFlags.IsFlagSet(DebuggingFlags.VisualizeEntireScreen)) {
+                    if (!switchedRenderTargets) {
+                        switchedRenderTargets = true;
+                        prevRenderTarget = RenderTexture.active;
+                        Graphics.SetRenderTarget(null);
+                    }
+
                     GL.PushMatrix();
                     GL.LoadOrtho();
                     GL.Viewport(new Rect(0, 0, m_LastKnownResolution.width, m_LastKnownResolution.height));
@@ -529,6 +596,10 @@ namespace FieldDay.Rendering {
                     string debugText = string.Format("Screen Dimensions: {0} ({1})", m_LastKnownResolution, m_LastKnownFullscreen ? "FULLSCREEN" : "NOT FULLSCREEN");
 
                     DebugDraw.AddViewportText(new Vector2(0.5f, 1), new Vector2(0, -8), debugText, Color.white, 0, TextAnchor.UpperCenter, DebugTextStyle.BackgroundDarkOpaque);
+                }
+
+                if (switchedRenderTargets) {
+                    Graphics.SetRenderTarget(prevRenderTarget);
                 }
             }
         }
@@ -571,7 +642,8 @@ namespace FieldDay.Rendering {
         [EngineMenuFactory]
         static private DMInfo CreateRenderDebugMenu() {
             DMInfo info = new DMInfo("Rendering", 16);
-            DebugFlags.Menu.AddSingleFrameFlagButton(info, "Trace Execution for Frame", DebuggingFlags.TraceExecution);
+            DebugFlags.Menu.AddFlagToggle(info, "Trace Execution", DebuggingFlags.TraceExecution);
+            DebugFlags.Menu.AddSingleFrameFlagButton(info, "Trace Execution (Frame)", DebuggingFlags.TraceExecution);
             DebugFlags.Menu.AddFlagToggle(info, "Render Debug Info", DebuggingFlags.VisualizeEntireScreen);
             info.AddDivider();
 

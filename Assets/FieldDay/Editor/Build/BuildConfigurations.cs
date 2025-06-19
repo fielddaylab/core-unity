@@ -65,7 +65,11 @@ namespace FieldDay.Editor {
             }
 
             PlayerSettings.SetManagedStrippingLevel(EditorUserBuildSettings.selectedBuildTargetGroup, codeStripping);
-            EditorUserBuildSettings.development = development; 
+            PlayerSettings.WebGL.exceptionSupport = development ? WebGLExceptionSupport.FullWithStacktrace : WebGLExceptionSupport.ExplicitlyThrownExceptionsOnly;
+            EditorUserBuildSettings.development = development;
+            EditorUserBuildSettings.androidBuildType = development ? AndroidBuildType.Debug : AndroidBuildType.Release;
+            PlayerSettings.Android.minifyDebug = development;
+            PlayerSettings.Android.minifyRelease = !development;
             BuildUtils.WriteDefines(defines);
 
             try {

@@ -9,7 +9,9 @@
         "BeauPools",
         "BeauUtil.Editor",
         "FieldDay.Core",
-        "ScriptableBake"
+        "ScriptableBake",
+        "Whinarn.UnityMeshSimplifier.Runtime",
+        "Whinarn.UnityMeshSimplifier.Editor"
     ],
     "includePlatforms": [
         "Editor"
@@ -20,6 +22,17 @@
     "precompiledReferences": [],
     "autoReferenced": true,
     "defineConstraints": [],
-    "versionDefines": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.render-pipelines.universal",
+            "expression": "0.0.1",
+            "define": "HAS_URP"
+        },
+        {
+            "name": "com.whinarn.unitymeshsimplifier",
+            "expression": "0.0.1",
+            "define": "HAS_MESHSIMPLIFIER"
+        }
+    ],
     "noEngineReferences": false
 }

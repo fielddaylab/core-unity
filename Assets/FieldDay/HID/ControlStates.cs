@@ -1,7 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
 using BeauUtil;
-using TinyIL;
 
 namespace FieldDay.HID {
     /// <summary>
@@ -104,6 +103,15 @@ namespace FieldDay.HID {
             return s;
         }
 
+        static public DigitalControlStates operator ^(DigitalControlStates a, DigitalControlStates b) {
+            DigitalControlStates s;
+            s.Current = a.Current ^ b.Current;
+            s.Prev = a.Prev ^ b.Prev;
+            s.Pressed = a.Pressed ^ b.Pressed;
+            s.Released = a.Released ^ b.Released;
+            return s;
+        }
+
         #endregion // Operators
     }
 
@@ -172,7 +180,7 @@ namespace FieldDay.HID {
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public readonly bool IsDownAll(TEnum mask) {
-            return (Enums.ToUInt(Current) & Enums.ToUInt(mask)) == Enums.ToUInt(mask);
+            return AreEqual(And(Current, mask), mask);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -207,44 +215,47 @@ namespace FieldDay.HID {
             return s;
         }
 
+        static public DigitalControlStates<TEnum> operator ^(DigitalControlStates<TEnum> a, DigitalControlStates<TEnum> b) {
+            DigitalControlStates<TEnum> s;
+            s.Current = Xor(a.Current, b.Current);
+            s.Prev = Xor(a.Prev, b.Prev);
+            s.Pressed = Xor(a.Pressed, b.Pressed);
+            s.Released = Xor(a.Released, b.Released);
+            return s;
+        }
+
         #endregion // Operators
 
         #region Helper Functions
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        //[IntrinsicIL("ldarg.0; ldarg.1; and; ret;")]
         static private TEnum And(TEnum a, TEnum b) {
-            return Enums.ToEnum<TEnum>(Enums.ToUInt(a) & Enums.ToUInt(b));
+            return Enums.And(a, b);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        //[IntrinsicIL("ldarg.0; ldarg.1; or; ret;")]
         static private TEnum Or(TEnum a, TEnum b) {
-            return Enums.ToEnum<TEnum>(Enums.ToUInt(a) | Enums.ToUInt(b));
+            return Enums.Or(a, b);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        //[IntrinsicIL("ldarg.0; ldarg.1; xor; ret;")]
         static private TEnum Xor(TEnum a, TEnum b) {
-            return Enums.ToEnum<TEnum>(Enums.ToUInt(a) ^ Enums.ToUInt(b));
+            return Enums.Xor(a, b);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        //[IntrinsicIL("ldarg.0; not; ret;")]
         static private TEnum Not(TEnum a) {
-            return Enums.ToEnum<TEnum>(~Enums.ToUInt(a));
+            return Enums.Not(a);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [IntrinsicIL("ldarg.0; conv.u4; ldc.i4.0; cgt.un; ret;")]
         static private bool NotZero(TEnum a) {
-            return Enums.ToUInt(a) != 0;
+            return Enums.IsNotZero(a);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        //[IntrinsicIL("ldarg.0; ldarg.1; ceq; ret;")]
-        static private bool Equal(TEnum a, TEnum b) {
-            return Enums.ToUInt(a) == Enums.ToUInt(b);
+        static private bool AreEqual(TEnum a, TEnum b) {
+            return Enums.AreEqual(a, b);
         }
 
         #endregion // Helper Functions

@@ -43,6 +43,9 @@ using FieldDay.Debugging;
 using FieldDay.Perf;
 using FieldDay.SharedState;
 using FieldDay.Systems;
+using FieldDay.Threading;
+using FieldDay.Localization;
+using FieldDay.Files;
 
 #if USE_SRP
 #endif // USE_SRP
@@ -62,10 +65,18 @@ namespace FieldDay {
         private int m_TargetFramerate = 60;
 
         [SerializeField]
+        private LanguageId m_DefaultLanguage = LanguageId.English;
+
+        [SerializeField]
         private Sprite m_DefaultPixelSprite;
 
         [SerializeField]
         private bool m_AllowMultiTouchInput = false;
+
+        [SerializeField]
+        private ReflectionBootData m_ReflectionData;
+
+        [Header("Modules")]
 
         [SerializeField]
         private AudioMgr.Config m_AudioConfig = new AudioMgr.Config();
@@ -73,8 +84,18 @@ namespace FieldDay {
         [SerializeField]
         private MemoryPoolConfiguration m_MemoryConfig = new MemoryPoolConfiguration() {
             MaterialCapacity = 16,
-            MeshCapacity = 16
+            MeshCapacity = 16,
+            UnmanagedBudgetMB = 2
         };
+
+        [SerializeField]
+        private GuiMgr.Config m_GuiConfig = new GuiMgr.Config();
+
+        [SerializeField]
+        private FileSystem.Config m_FileSystemConfig = new FileSystem.Config();
+
+        [SerializeField]
+        private AssetPack[] m_GlobalAssetPacks = Array.Empty<AssetPack>();
 
         #endregion // Inspector
 
@@ -176,6 +197,7 @@ namespace FieldDay {
         static private ushort s_PrevUpdateFrameIndex = Frame.InvalidIndex;
         static private bool s_ReadyForRender;
         static private bool s_Initialized;
+        static private bool s_WasLoadingSceneAtFrameStart;
 
         // update masks
         static private int s_UpdateMask = Bits.All32;
@@ -190,10 +212,15 @@ namespace FieldDay {
         static private bool s_AppFocusState = false;
         static private bool s_AppPauseState = false;
 
+        // crash
+        static private bool s_Crashed = false;
+
         // profiling
         static private PhaseTiming s_TimeProfiling;
 
         [NonSerialized] private bool m_Initialized;
+
+        static private GameLoop s_Instance;
 
         #region Unity Events
 
@@ -206,130 +233,167 @@ namespace FieldDay {
             s_Initialized = true;
             m_Initialized = true;
             DontDestroyOnLoad(gameObject);
+            s_Instance = this;
             Log.Msg("[GameLoop] Starting...");
-            Frame.MarkTimestampOffset();
-            Frame.CreateAllocator(m_SingleFrameAllocBufferSize);
-            CounterHandle.InitializeAllocator(256);
+            Log.Msg("[GameLoop] Word Size = {0} ({1})", Unsafe.PointerSize, Unsafe.IsPointerSizeCompileTimeConstant ? "compile-time" : "runtime");
+            Log.Msg("[GameLoop] Stopwatch Frequency = {0}hz", System.Diagnostics.Stopwatch.Frequency);
 
-            Input.multiTouchEnabled = m_AllowMultiTouchInput;
-            CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
-            CultureInfo.CurrentUICulture = CultureInfo.InvariantCulture;
-            BuildInfo.Load();
+            if (ReflectionBootData.ShouldUse()) {
+                ReflectionBootData.Mount(m_ReflectionData);
+            }
 
-            CommandLineArgs.Initialize();
-            ApplyCommandLineArguments();
+            using (Profiling.Time("GameLoop.Awake")) {
+                Frame.MarkTimestampOffset();
+                Frame.CreateAllocator(m_SingleFrameAllocBufferSize);
+                CounterHandle.InitializeAllocator(256);
 
-            Log.Msg("[GameLoop] Creating memory manager...");
-            Game.Memory = new MemoryMgr();
-            Game.Memory.Initialize(m_MemoryConfig);
+                Input.multiTouchEnabled = m_AllowMultiTouchInput;
+                CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+                CultureInfo.CurrentUICulture = CultureInfo.InvariantCulture;
+                BuildInfo.Load();
 
-            Log.Msg("[GameLoop] Creating systems manager...");
-            Game.Systems = new SystemsMgr();
+                CommandLineArgs.Initialize();
+                ApplyCommandLineArguments();
 
-            Log.Msg("[GameLoop] Creating component manager...");
-            Game.Components = new ComponentMgr(Game.Systems);
+                Log.Msg("[GameLoop] Creating memory manager...");
+                Game.Memory = new MemoryMgr();
+                Game.Memory.Initialize(m_MemoryConfig);
 
-            Log.Msg("[GameLoop] Creating shared state manager...");
-            Game.SharedState = new SharedStateMgr();
+                Log.Msg("[GameLoop] Creating file system...");
+                Game.Files = new FileSystem();
+                Game.Files.Initialize(m_FileSystemConfig);
 
-            Log.Msg("[GameLoop] Creating process manager...");
-            Game.Processes = new ProcessMgr();
+                Log.Msg("[GameLoop] Creating performance manager...");
+                Game.Perf = new PerformanceMgr();
 
-            Log.Msg("[GameLoop] Creating audio manager...");
-            Game.Audio = new AudioMgr(m_AudioConfig);
+                Log.Msg("[GameLoop] Creating localization manager...");
+                // TODO: create localization manager
+                Loc.ConfigureDefaultLanguage(m_DefaultLanguage);
 
-            Log.Msg("[GameLoop] Creating scene manager...");
-            Game.Scenes = new SceneMgr();
+                Log.Msg("[GameLoop] Creating asset manager...");
+                Game.Assets = new AssetMgr();
 
-            Log.Msg("[GameLoop] Creating rendering manager...");
-            Game.Rendering = new RenderMgr();
-            Game.Rendering.Initialize();
+                Log.Msg("[GameLoop] Creating systems manager...");
+                Game.Systems = new SystemsMgr();
 
-            Log.Msg("[GameLoop] Creating input manager...");
-            Game.Input = new InputMgr();
+                Log.Msg("[GameLoop] Creating component manager...");
+                Game.Components = new ComponentMgr(Game.Systems);
 
-            Log.Msg("[GameLoop] Creating gui manager...");
-            Game.Gui = new GuiMgr(Game.Input);
+                Log.Msg("[GameLoop] Creating shared state manager...");
+                Game.SharedState = new SharedStateMgr();
 
-            Log.Msg("[GameLoop] Creating asset manager...");
-            Game.Assets = new AssetMgr();
+                Log.Msg("[GameLoop] Creating process manager...");
+                Game.Processes = new ProcessMgr();
 
-            Log.Msg("[GameLoop] Creating animation manager...");
-            Game.Animation = new AnimationMgr();
+                Log.Msg("[GameLoop] Creating audio manager...");
+                Game.Audio = new AudioMgr(m_AudioConfig);
 
-            CursorUtility.PlatformInit();
+                Log.Msg("[GameLoop] Creating scene manager...");
+                Game.Scenes = new SceneMgr();
+
+                Log.Msg("[GameLoop] Creating rendering manager...");
+                Game.Rendering = new RenderMgr();
+                Game.Rendering.Initialize();
+
+                Log.Msg("[GameLoop] Creating input manager...");
+                Game.Input = new InputMgr();
+
+                Log.Msg("[GameLoop] Creating gui manager...");
+                Game.Gui = new GuiMgr(m_GuiConfig, Game.Input);
+
+                Log.Msg("[GameLoop] Creating animation manager...");
+                Game.Animation = new AnimationMgr();
+
+                CursorUtility.PlatformInit();
 
 #if UNITY_WEBGL && !UNITY_EDITOR
-            if (m_TargetFramerate == 60) {
-                Application.targetFrameRate = -1;
-            } else {
-                Application.targetFrameRate = m_TargetFramerate;
-            }
-            QualitySettings.vSyncCount = 0;
+                if (m_TargetFramerate == 60) {
+                    Application.targetFrameRate = -1;
+                } else {
+                    Application.targetFrameRate = m_TargetFramerate;
+                }
+                QualitySettings.vSyncCount = 0;
 #else
-            Application.targetFrameRate = m_TargetFramerate;
+                Application.targetFrameRate = m_TargetFramerate;
 #endif // UNITY_WEBGL
 
-            Log.Msg("[GameLoop] Loading config vars...");
-            ConfigVar.ReadAllFromResources();
-            ConfigVar.ReadUserFromPlayerPrefs();
-            SharedCanvasResources.DefaultWhiteSprite = m_DefaultPixelSprite;
+                Log.Msg("[GameLoop] Loading config vars...");
+                ConfigVar.ReadAllFromResources();
+                ConfigVar.ReadUserFromPlayerPrefs();
+                SharedCanvasResources.DefaultWhiteSprite = m_DefaultPixelSprite;
 
-            // find all pre-boot
-            foreach (var entrypoint in Reflect.FindMethods<InvokePreBootAttribute>(ReflectionCache.UserAssemblies, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static)) {
-                entrypoint.Info.Invoke(null, null);
-            }
+                // find all pre-boot
+                foreach (var entrypoint in ReflectionBootData.GetPreBoot()) {
+                    ((MethodInfo) entrypoint.Info).Invoke(null, null);
+                }
 
-            enabled = false;
-            useGUILayout = false;
-            StartCoroutine(DelayedBoot());
+                enabled = false;
+                useGUILayout = false;
+                StartCoroutine(DelayedBoot());
 
-            Game.Components.Lock();
+                Game.Components.Lock();
 
-            Async.InvokeAsync(PotentiallyExpensiveSystemResourceRetrieval);
+                Async.InvokeAsync(PotentiallyExpensiveSystemResourceRetrieval);
 
-            CrashHandler.Register();
-            CrashHandler.DisplayCrash += OnCrash;
+                CrashHandler.Register();
+                CrashHandler.DisplayCrash += OnCrash;
 #if !UNITY_EDITOR
-            CrashHandler.Enabled = true;
+                CrashHandler.Enabled = true;
 #endif // UNITY_EDITOR
+
+                Game.Files.Tick();
+                Game.Gui.FlushCommands();
+                Async.InvokeAsync(Game.Gui.FlushCommands);
+            }
         }
 
         private void Start() {
             Log.Msg("[GameLoop] Boot finished");
-            SetCurrentPhase(GameLoopPhase.Booted);
-            Game.Components.Unlock();
-            Game.Input.Initialize();
-            Game.Gui.Initialize();
-            Game.Rendering.LateInitialize();
-            Game.Animation.Initialize();
-			Game.Scenes.Prepare();
-            Game.Systems.ProcessInitQueue();
-            FlushQueue(s_OnBootQueue);
+            using (Profiling.Time("GameLoop.Start")) {
+                SetCurrentPhase(GameLoopPhase.Booted);
 
-            FinishCallbackRegistration();
+                foreach(var pack in m_GlobalAssetPacks) {
+                    Game.Assets.LoadPackage(pack);
+                }
 
-            // find all boot
-            foreach (var entrypoint in Reflect.FindMethods<InvokeOnBootAttribute>(ReflectionCache.UserAssemblies, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static)) {
-                entrypoint.Info.Invoke(null, null);
-            }
+                Game.Components.Unlock();
+                Game.Input.Initialize();
+                Game.Gui.Initialize();
+                Game.Rendering.LateInitialize();
+                Game.Animation.Initialize();
+                Game.Scenes.Prepare();
+                Game.Systems.ProcessInitQueue();
+                Game.Files.Tick();
+                FlushQueue(s_OnBootQueue);
+
+                FinishCallbackRegistration();
+
+                // find all boot
+                foreach (var entrypoint in ReflectionBootData.GetBoot()) {
+                    ((MethodInfo) entrypoint.Info).Invoke(null, null);
+                }
 
 #if PREVIEW || DEVELOPMENT
-            FramerateDisplay.Show();
-#else
-            if (CommandLineArgs.HasFlag("show-fps")) {
                 FramerateDisplay.Show();
-                Debug.LogWarning("[GameLoop] 'show-fps' flag found, framerate counter displayed");
-            }
+#else
+                if (CommandLineArgs.HasFlag("show-fps")) {
+                    FramerateDisplay.Show();
+                    Debug.LogWarning("[GameLoop] 'show-fps' flag found, framerate counter displayed");
+                }
 #endif // PREVIEW || DEVELOPMENT
 
-            if (!Game.Rendering.HasFallbackCamera()) {
-                Game.Rendering.CreateDefaultFallbackCamera();
-            }
+                if (!Game.Rendering.HasFallbackCamera()) {
+                    Game.Rendering.CreateDefaultFallbackCamera();
+                }
 
-            // fallback
-            if (Game.Events == null) {
-                Game.SetEventDispatcher(new EventDispatcher<EvtArgs>());
+                // fallback
+                if (Game.Events == null) {
+                    Game.SetEventDispatcher(new EventDispatcher<EvtArgs>());
+                }
+
+                s_WasLoadingSceneAtFrameStart = Game.Scenes.IsMainLoading();
+
+                Game.Gui.FlushCommands();
             }
         }
 
@@ -350,7 +414,7 @@ namespace FieldDay {
                 if (fps <= 0) {
                     fps = -1;
                 }
-                Application.targetFrameRate = fps;
+                SetTargetFramerate(fps);
                 Debug.LogWarningFormat("[GameLoop] 'force-fps' flag found, Application.targetFrameRate set to {0}", fps);
             }
 
@@ -404,6 +468,7 @@ namespace FieldDay {
             CounterHandle.DestroyAllocator();
             CrashHandler.Deregister();
             s_Initialized = m_Initialized = false;
+            s_Instance = null;
         }
 
         private void OnApplicationQuit() {
@@ -424,10 +489,6 @@ namespace FieldDay {
             Log.Msg("[GameLoop] Shutting down animation manager...");
             Game.Animation.Shutdown();
             Game.Animation = null;
-
-            Log.Msg("[GameLoop] Shutting down asset manager...");
-            Game.Assets.Shutdown();
-            Game.Assets = null;
 
             Log.Msg("[GameLoop] Shutting down gui manager...");
             Game.Gui.Shutdown();
@@ -471,6 +532,18 @@ namespace FieldDay {
                 Game.SetEventDispatcher(null);
             }
 
+            Log.Msg("[GameLoop] Shutting down asset manager...");
+            Game.Assets.Shutdown();
+            Game.Assets = null;
+
+            Log.Msg("[GameLoop] Shutting down performance manager...");
+            Game.Perf.Shutdown();
+            Game.Perf = null;
+
+            Log.Msg("[GameLoop] Shutting down file system...");
+            Game.Files.Shutdown();
+            Game.Files = null;
+
             Log.Msg("[GameLoop] Shutting down memory manager...");
             Game.Memory.Shutdown();
             Game.Memory = null;
@@ -504,13 +577,16 @@ namespace FieldDay {
         private void FixedUpdate() {
             Frame.UnscaledDeltaTime = Time.deltaTime;
             Frame.DeltaTime = Frame.UnscaledDeltaTime * s_TimeScale;
+            Frame.UnscaledDeltaRatio = 1;
+            Frame.DeltaRatio = s_TimeScale;
 
             HandlePreUpdate();
             SetCurrentPhase(GameLoopPhase.FixedUpdate);
             if (!IsPaused()) {
                 Game.Components.Lock();
-                Game.Systems.FixedUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Systems.FixedUpdate(Frame.DeltaTime, s_UpdateMask, s_WasLoadingSceneAtFrameStart);
                 Game.Processes.FixedUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Animation.FixedUpdateLite(Frame.DeltaTime);
                 Game.Components.Unlock();
                 OnFixedUpdate.Invoke(Frame.DeltaTime);
             }
@@ -520,7 +596,7 @@ namespace FieldDay {
             SetCurrentPhase(GameLoopPhase.LateFixedUpdate);
             if (!IsPaused()) {
                 Game.Components.Lock();
-                Game.Systems.LateFixedUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Systems.LateFixedUpdate(Frame.DeltaTime, s_UpdateMask, s_WasLoadingSceneAtFrameStart);
                 Game.Processes.LateFixedUpdate(Frame.DeltaTime, s_UpdateMask);
                 Game.Components.Unlock();
                 OnLateFixedUpdate.Invoke(Frame.DeltaTime);
@@ -530,6 +606,8 @@ namespace FieldDay {
         private void Update() {
             Frame.UnscaledDeltaTime = Time.deltaTime;
             Frame.DeltaTime = Frame.UnscaledDeltaTime * s_TimeScale;
+            Frame.UnscaledDeltaRatio = Frame.UnscaledDeltaTime * m_TargetFramerate;
+            Frame.DeltaRatio = Frame.DeltaTime * m_TargetFramerate;
 
             // just in case we didn't have a FixedUpdate this frame
             HandlePreUpdate();
@@ -538,7 +616,7 @@ namespace FieldDay {
             SetCurrentPhase(GameLoopPhase.Update);
             if (!IsPaused()) {
                 Game.Components.Lock();
-                Game.Systems.Update(Frame.DeltaTime, s_UpdateMask);
+                Game.Systems.Update(Frame.DeltaTime, s_UpdateMask, s_WasLoadingSceneAtFrameStart);
                 Game.Processes.Update(Frame.DeltaTime, s_UpdateMask);
                 Game.Animation.UpdateLite(Frame.DeltaTime);
                 Game.Components.Unlock();
@@ -549,10 +627,11 @@ namespace FieldDay {
             SetCurrentPhase(GameLoopPhase.UnscaledUpdate);
             if (!IsPaused()) {
                 Game.Components.Lock();
-                Game.Systems.UnscaledUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                Game.Systems.UnscaledUpdate(Frame.UnscaledDeltaTime, s_UpdateMask, s_WasLoadingSceneAtFrameStart);
                 Game.Processes.UnscaledUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
                 Game.Animation.UnscaledUpdateLite(Frame.UnscaledDeltaTime);
                 Game.Components.Unlock();
+                Game.Files.Tick();
                 OnUnscaledUpdate.Invoke(Frame.UnscaledDeltaTime);
             }
 
@@ -560,6 +639,8 @@ namespace FieldDay {
             // flush event queue
             Game.Events.Flush();
             Game.Gui.FlushCommands();
+            Game.Files.Tick();
+            Game.Audio.Update(Frame.UnscaledDeltaTime);
         }
 
         private void LateUpdate() {
@@ -567,7 +648,7 @@ namespace FieldDay {
             SetCurrentPhase(GameLoopPhase.LateUpdate);
             if (!IsPaused()) {
                 Game.Components.Lock();
-                Game.Systems.LateUpdate(Frame.DeltaTime, s_UpdateMask);
+                Game.Systems.LateUpdate(Frame.DeltaTime, s_UpdateMask, s_WasLoadingSceneAtFrameStart);
                 Game.Processes.LateUpdate(Frame.DeltaTime, s_UpdateMask);
                 Game.Components.Unlock();
                 OnLateUpdate.Invoke(Frame.DeltaTime);
@@ -577,26 +658,30 @@ namespace FieldDay {
             SetCurrentPhase(GameLoopPhase.UnscaledLateUpdate);
             if (!IsPaused()) {
                 Game.Components.Lock();
-                Game.Systems.UnscaledLateUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                Game.Systems.UnscaledLateUpdate(Frame.UnscaledDeltaTime, s_UpdateMask, s_WasLoadingSceneAtFrameStart);
                 Game.Processes.UnscaledLateUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
                 Game.Components.Unlock();
                 OnUnscaledLateUpdate.Invoke(Frame.UnscaledDeltaTime);
             }
 
             Game.Gui.ProcessUpdate();
-            Game.Audio.Update(Frame.UnscaledDeltaTime);
 
             // flush event queue
             Game.Events.Flush();
             Game.Gui.FlushCommands();
+            Game.Files.Tick();
+            Game.Audio.LateUpdate(Frame.UnscaledDeltaTime);
+            Game.Memory.Update();
 
             FlushQueue(s_AfterLateUpdateQueue);
             Game.Scenes.Update();
+            Game.Assets.Update();
             Game.Rendering.PollScreenSettings();
 
             s_ReadyForRender = true;
         }
 
+#if !SKIP_ONGUI
         private void OnGUI() {
             EventType type = Event.current.type;
             OnGuiEvent.Invoke(Event.current);
@@ -607,6 +692,7 @@ namespace FieldDay {
             }
 #endif // UNITY_EDITOR
         }
+#endif // !SKIP_ONGUI
 
         void ICameraPreCullCallback.OnCameraPreCull(Camera camera, CameraCallbackSource source) {
             if (!s_ReadyForRender) {
@@ -638,11 +724,15 @@ namespace FieldDay {
                 return;
             }
 #endif // UNITY_EDITOR
+            if (s_Crashed) {
+                return;
+            }
+
             SetCurrentPhase(GameLoopPhase.ApplicationPreRender);
             OnApplicationPreRender.Invoke();
             if (!IsPaused()) {
                 Game.Components.Lock();
-                Game.Systems.ApplicationPreRender(Frame.DeltaTime, s_UpdateMask);
+                Game.Systems.ApplicationPreRender(Frame.DeltaTime, s_UpdateMask, s_WasLoadingSceneAtFrameStart);
                 Game.Components.Unlock();
             }
         }
@@ -654,14 +744,14 @@ namespace FieldDay {
 
         private IEnumerator LateFixedUpdateRoutine() {
             object fixedUpdate = new WaitForFixedUpdate();
-            while(true) {
+            while(!s_Crashed) {
                 yield return fixedUpdate;
                 LateFixedUpdate();
             }
         }
 
         static private IEnumerator EndOfFrameCoroutine() {
-            while (true) {
+            while (!s_Crashed) {
                 yield return s_EndOfFrame;
                 OnEndOfFrame();
             }
@@ -683,6 +773,7 @@ namespace FieldDay {
 
         static private void HandlePreUpdate() {
             if (s_PrevUpdateFrameIndex != Frame.Index) {
+                s_TimeProfiling.MarkEnd(s_CurrentPhase);
                 ReportPerfTimings(s_TimeProfiling);
                 s_TimeProfiling.Clear();
 
@@ -691,6 +782,7 @@ namespace FieldDay {
                 DebugInput.Update();
                 s_PrevUpdateFrameIndex = Frame.Index;
                 Frame.UnscaledDeltaTime = Time.unscaledDeltaTime;
+                s_WasLoadingSceneAtFrameStart = Game.Scenes.IsMainLoading();
                 DequeueNextValues();
                 FlushQueue(s_FrameStartQueue);
 
@@ -702,12 +794,13 @@ namespace FieldDay {
 
                 // DEBUG UPDATE
                 Game.Components.Lock();
-                Game.Systems.DebugUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                Game.Systems.DebugUpdate(Frame.UnscaledDeltaTime, s_UpdateMask, s_WasLoadingSceneAtFrameStart);
                 Game.Processes.DebugUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
                 Game.Components.Unlock();
 
                 OnDebugUpdate.Invoke(Frame.UnscaledDeltaTime);
                 Game.Audio.PreUpdate(Frame.UnscaledDeltaTime);
+                Game.Files.Tick();
 
                 // PRE UPDATE
 
@@ -717,7 +810,7 @@ namespace FieldDay {
 
                 if (!IsPaused()) {
                     Game.Components.Lock();
-                    Game.Systems.PreUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
+                    Game.Systems.PreUpdate(Frame.UnscaledDeltaTime, s_UpdateMask, s_WasLoadingSceneAtFrameStart);
                     Game.Processes.PreUpdate(Frame.UnscaledDeltaTime, s_UpdateMask);
                     Game.Components.Unlock();
 
@@ -731,6 +824,10 @@ namespace FieldDay {
         }
 
         static private void OnPreCanvasRender() {
+            if (s_Crashed) {
+                return;
+            }
+
             SetCurrentPhase(GameLoopPhase.CanvasPreRender);
             Game.Gui.FlushCommands();
             OnCanvasPreRender.Invoke();
@@ -755,18 +852,10 @@ namespace FieldDay {
             Frame.DeltaTime = Frame.UnscaledDeltaTime * s_TimeScale;
         }
 
-        static private unsafe void ReportPerfTimings(PhaseTiming timing) {
-            // TODO: Implement
-            //using(PooledStringBuilder psb = PooledStringBuilder.Create()) {
-            //    psb.Builder.Append("[GameLoop] PreUpdate ").AppendNoAlloc(timing.Duration[0]).Append("\n FixedUpdate ").AppendNoAlloc(timing.Duration[1])
-            //        .Append("\n Update ").AppendNoAlloc(timing.Duration[2] + timing.Duration[3])
-            //        .Append("\n LateUpdate ").AppendNoAlloc(timing.Duration[4] + timing.Duration[5])
-            //        .Append("\n CanvasPreRender ").AppendNoAlloc(timing.Duration[6])
-            //        .Append("\n CameraPreCull ").AppendNoAlloc(timing.Duration[7]).Append("\n CameraPreRender ").AppendNoAlloc(timing.Duration[8])
-            //        .Append("\n CameraPostRender ").AppendNoAlloc(timing.Duration[9])
-            //        .Append("\n FrameAdvanced ").AppendNoAlloc(timing.Duration[10]);
-            //    Log.Msg(psb.Builder.Flush());
-            //}
+        static private unsafe void ReportPerfTimings(in PhaseTiming timing) {
+            if (!s_DebugPause) {
+                Game.Perf.RecordTiming(timing);
+            }
         }
 
         static private void PotentiallyExpensiveSystemResourceRetrieval() {
@@ -780,9 +869,13 @@ namespace FieldDay {
             Routine.Settings.Paused = true;
             GameLoop.SetDebugPause(true);
             AudioListener.pause = true;
+            s_DebugPause = true;
+            s_TimeScale = s_QueuedTimeScale = 0;
+            s_ReadyForRender = false;
+            s_Crashed = true;
 
             // disable all raycasters
-            foreach(var raycaster in GameObject.FindObjectsOfType<BaseRaycaster>()) {
+            foreach (var raycaster in GameObject.FindObjectsOfType<BaseRaycaster>()) {
                 raycaster.enabled = false;
             }
 
@@ -797,6 +890,7 @@ namespace FieldDay {
             }
 
             context = contextBuilder.Flush();
+            s_Instance.enabled = false;
         }
 
         #endregion // Handlers
@@ -859,6 +953,13 @@ namespace FieldDay {
         }
 
         /// <summary>
+        /// Is the GameLoop finished booting.
+        /// </summary>
+        static public bool IsBooted() {
+            return s_Initialized && s_CurrentPhase >= GameLoopPhase.Booted;
+        }
+
+        /// <summary>
         /// Is the game loop currently executing pre-update, fixed update, or late update.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -908,6 +1009,11 @@ namespace FieldDay {
         #region Update Mask
 
         /// <summary>
+        /// Returns if the main scene was loading at the start of this frame.
+        /// </summary>
+        static public bool IsLoading { get { return s_WasLoadingSceneAtFrameStart; } }
+
+        /// <summary>
         /// Mask of all process and system categories allowed to update.
         /// </summary>
         static public int UpdateMask { get { return s_UpdateMask; } }
@@ -945,6 +1051,23 @@ namespace FieldDay {
             set { s_QueuedTimeScale = value; }
         }
 
+        /// <summary>
+        /// Updates the target framerate.
+        /// </summary>
+        static public void SetTargetFramerate(int targetFramerate) {
+#if UNITY_WEBGL && !UNITY_EDITOR
+            if (targetFramerate == 60) {
+                Application.targetFrameRate = -1;
+            } else {
+                Application.targetFrameRate = targetFramerate;
+            }
+#else
+            Application.targetFrameRate = targetFramerate;
+#endif // UNITY_WEBGL && !UNITY_EDITOR
+
+            s_Instance.m_TargetFramerate = targetFramerate <= 0 ? 60 : targetFramerate;
+        }
+
         #endregion // Time Scale
 
         #region Pausing
@@ -960,6 +1083,10 @@ namespace FieldDay {
         /// Sets the debug pause value.
         /// </summary>
         static internal void SetDebugPause(bool paused) {
+            if (s_Crashed) {
+                return;
+            }
+
             s_DebugPause = paused;
         }
 
@@ -979,6 +1106,17 @@ namespace FieldDay {
         }
 
         #endregion // Debug
+
+        #region Hosting
+
+        /// <summary>
+        /// The global host.
+        /// </summary>
+        static public GameLoop Host {
+            get { return s_Instance; }
+        }
+
+        #endregion // Hosting
     }
 
     /// <summary>

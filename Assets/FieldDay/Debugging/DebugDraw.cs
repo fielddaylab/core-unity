@@ -13,6 +13,12 @@ using System.Diagnostics;
 using BeauUtil.Debugger;
 using System.Runtime.InteropServices;
 using UnityEngine.Rendering;
+using BeauPools;
+using System.Text;
+using System.Collections;
+using System.Collections.Generic;
+
+
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -29,6 +35,15 @@ namespace FieldDay.Debugging {
 #if DEVELOPMENT
 
         #region Types
+
+        [Serializable]
+        private struct TextGroupSettings {
+            public Vector2 Position;
+            public Vector2 Offset;
+            public TextAnchor Alignment;
+            public DebugTextStyle Style;
+            public Color32 Color;
+        }
 
         private enum EnableMode {
             Enabled,
@@ -71,9 +86,96 @@ namespace FieldDay.Debugging {
             public Vector3 Position;
             public Vector2 Offset;
             public bool WorldSpace;
-            public string Text;
+            public DebugString Text;
             public TextAnchor Alignment;
             public DebugTextStyle Style;
+        }
+
+        [DefaultSorter(typeof(GroupedTextRenderState.Sorter))]
+        private struct GroupedTextRenderState {
+            public ulong Index;
+
+            public Color32 Color;
+            public DrawState State;
+
+            public DebugString Text;
+
+            public class Sorter : IComparer<GroupedTextRenderState> {
+                int IComparer<GroupedTextRenderState>.Compare(GroupedTextRenderState x, GroupedTextRenderState y) {
+                    return x.Index < y.Index ? -1 : 1;
+                }
+            }
+        }
+
+        private struct DebugString {
+            public readonly string String;
+            public readonly DebugStringBuffer Buffer;
+            public readonly int Length;
+
+            public DebugString(DebugStringBuffer buffer) {
+                String = buffer.Buffer;
+                Buffer = buffer;
+                Length = buffer.FirstNullIndex;
+            }
+
+            public DebugString(string constString) {
+                String = constString;
+                Buffer = null;
+                Length = constString.Length;
+            }
+        }
+
+        private sealed class DebugStringBuffer {
+            public readonly string Buffer;
+            public readonly IPool<DebugStringBuffer> Pool;
+            public int FirstNullIndex;
+
+            public DebugStringBuffer(int size, IPool<DebugStringBuffer> pool) {
+                Buffer = new string(' ', size);
+                FirstNullIndex = size;
+                Pool = pool;
+            }
+        }
+
+        private struct DebugStringBufferBuckets {
+            public const int SmallLength = 64;
+            public const int MedLength = 256;
+            public const int LargeLength = 4096;
+
+            public IPool<DebugStringBuffer> Small;
+            public IPool<DebugStringBuffer> Medium;
+            public IPool<DebugStringBuffer> Large;
+
+            public DebugStringBufferBuckets(int small, int medium, int large) {
+                Small = new DynamicPool<DebugStringBuffer>(small, (p) => {
+                    return new DebugStringBuffer(SmallLength, p);
+                });
+                Medium = new DynamicPool<DebugStringBuffer>(medium, (p) => {
+                    return new DebugStringBuffer(MedLength, p);
+                });
+                Large = new DynamicPool<DebugStringBuffer>(large, (p) => {
+                    return new DebugStringBuffer(LargeLength, p);
+                });
+
+                Small.Prewarm();
+                Medium.Prewarm();
+
+                Large.Prewarm(1);
+            }
+
+            public DebugStringBuffer Alloc(int stringLength) {
+                Assert.True(stringLength > 0);
+                if (stringLength <= SmallLength) {
+                    return Small.Alloc();
+                } else if (stringLength <= MedLength) {
+                    return Medium.Alloc();
+                } else if (stringLength <= LargeLength) {
+                    return Large.Alloc();
+                } else {
+                    Log.Warn("[DebugStringBufferBuckets] Unable to allocate for a string of more than " + LargeLength + " characters ({0})", stringLength);
+                    return null;
+                }
+            }
         }
 
         #endregion // Types
@@ -102,6 +204,15 @@ namespace FieldDay.Debugging {
         [SerializeField] private Material m_DepthTestMaterial = null;
         [SerializeField] private Material m_OverlayMaterial = null;
 
+        [Header("Text Groups")]
+        [SerializeField]
+        private TextGroupSettings m_LogGroup = new TextGroupSettings() {
+            Alignment = TextAnchor.LowerLeft,
+            Color = Color.white,
+            Position = new Vector2(0, 0),
+            Offset = new Vector2(8, 32)
+        };
+
         #endregion // Inspector
 
         [NonSerialized] private Mesh m_MainMesh;
@@ -119,11 +230,16 @@ namespace FieldDay.Debugging {
         static private RingBuffer<Vector3x2RenderState> s_ActiveBoxes = new RingBuffer<Vector3x2RenderState>();
         static private RingBuffer<SphereRenderState> s_ActiveSpheres = new RingBuffer<SphereRenderState>();
         static private RingBuffer<TextRenderState> s_ActiveTexts = new RingBuffer<TextRenderState>();
+        static private RingBuffer<GroupedTextRenderState> s_ActiveLogTexts = new RingBuffer<GroupedTextRenderState>();
+
+        static private DebugStringBufferBuckets s_DebugStringPools = new DebugStringBufferBuckets(64, 16, 4);
+        static private readonly StringBuilder s_GroupedTextBuilder = new StringBuilder(2048);
 
         [NonSerialized] static private BitSet64 s_CategoryMask = new BitSet64();
         [NonSerialized] static private DebugDraw s_Instance;
         [NonSerialized] static private Camera s_MainCameraOverride;
         [NonSerialized] static private bool s_PauseAll = false;
+        [NonSerialized] static private ulong s_LogIndex = 0;
 
         [NonSerialized] private bool m_InitializedResources = false;
 
@@ -191,7 +307,11 @@ namespace FieldDay.Debugging {
             m_MainMeshData.Clear();
             m_OverlayMeshData.Clear();
 
-            Camera mainCam = s_MainCameraOverride ? s_MainCameraOverride : Camera.main;
+            Camera mainCam = s_MainCameraOverride ? s_MainCameraOverride : Game.Rendering.PrimaryCamera;
+            if (!mainCam) {
+                mainCam = Camera.main;
+            }
+
             if (mainCam) {
                 RenderLines(deltaTime, mainCam.transform.forward, s_CategoryMask, !s_PauseAll);
             }
@@ -233,7 +353,8 @@ namespace FieldDay.Debugging {
                 mainCam = Camera.main;
             }
             if (mainCam) {
-                RenderText(deltaTime, mainCam, s_CategoryMask, !s_PauseAll);
+                RenderText(deltaTime, s_ActiveTexts, mainCam, s_CategoryMask, !s_PauseAll);
+                RenderGroupedText(deltaTime, s_ActiveLogTexts, m_LogGroup, !s_PauseAll);
             } else {
                 DecayText(deltaTime); 
             }
@@ -255,7 +376,8 @@ namespace FieldDay.Debugging {
             Handles.BeginGUI();
 
             EnsureGUIResources();
-            RenderText(0, view.camera, s_CategoryMask, !s_PauseAll);
+            RenderText(0, s_ActiveTexts, view.camera, s_CategoryMask, !s_PauseAll);
+            RenderGroupedText(0, s_ActiveLogTexts, m_LogGroup, !s_PauseAll);
 
             Handles.EndGUI();
         }
@@ -283,6 +405,7 @@ namespace FieldDay.Debugging {
                 m_TextStylePlain.fontStyle = FontStyle.Normal;
                 m_TextStylePlain.fontSize = 0;
                 m_TextStylePlain.normal.textColor = Color.white;
+                m_TextStylePlain.richText = true;
 
                 m_TextStyleBox = new GUIStyle(m_TextStylePlain);
                 m_TextStyleBox.normal.background = Texture2D.whiteTexture;
@@ -290,6 +413,38 @@ namespace FieldDay.Debugging {
 
                 m_TextContent = new GUIContent();
                 m_InitializedResources = true;
+            }
+        }
+
+        static private void TryFreeDebugString(DebugString str) {
+            str.Buffer?.Pool.Free(str.Buffer);
+        }
+
+        static private DebugString AllocDebugString(string source) {
+            return new DebugString(source);
+        }
+
+        static private DebugString AllocDebugString(StringBuilder builder) {
+            int len = builder.Length;
+            if (len <= 0) {
+                return new DebugString(string.Empty);
+            }
+
+            DebugStringBuffer buff = s_DebugStringPools.Alloc(len);
+            if (buff != null) {
+                unsafe {
+                    int nullToWrite = buff.FirstNullIndex - len;
+                    fixed(char* s = buff.Buffer) {
+                        builder.CopyTo(0, new Span<char>(s, len), builder.Length);
+                        if (nullToWrite > 0) {
+                            Unsafe.Clear<char>(s + len, nullToWrite);
+                        }
+                    }
+                }
+                buff.FirstNullIndex = len;
+                return new DebugString(buff);
+            } else {
+                return new DebugString(builder.ToString());
             }
         }
 
@@ -361,10 +516,14 @@ namespace FieldDay.Debugging {
             }
         }
 
-        private void RenderText(float deltaTime, Camera camera, BitSet64 mask, bool allowRendering) {
+        private void RenderText(float deltaTime, RingBuffer<TextRenderState> buffer, Camera camera, BitSet64 mask, bool allowRendering) {
+            if (!allowRendering && deltaTime <= 0) {
+                return;
+            }
+
             int screenW = Screen.width, screenH = Screen.height;
-            for (int i = s_ActiveTexts.Count - 1; i >= 0; i--) {
-                ref TextRenderState state = ref s_ActiveTexts[i];
+            for (int i = buffer.Count - 1; i >= 0; i--) {
+                ref TextRenderState state = ref buffer[i];
 
                 if (allowRendering && (state.Params.Category < 0 || mask.IsSet(state.Params.Category))) {
                     Vector2 targetPoint;
@@ -408,7 +567,7 @@ namespace FieldDay.Debugging {
                     }
 
                     style.alignment = state.Alignment;
-                    m_TextContent.text = state.Text;
+                    m_TextContent.text = state.Text.String;
 
                     Vector2 size = style.CalcSize(m_TextContent);
 
@@ -451,22 +610,170 @@ namespace FieldDay.Debugging {
                 if (deltaTime > 0) {
                     state.State.Duration -= deltaTime;
                     if (state.State.Duration <= 0) {
-                        s_ActiveTexts.FastRemoveAt(i);
+                        TryFreeDebugString(state.Text);
+                        buffer.FastRemoveAt(i);
                     }
                 }
             }
         }
 
-        private void DecayText(float deltaTime) {
-            for (int i = s_ActiveTexts.Count - 1; i >= 0; i--) {
-                ref TextRenderState state = ref s_ActiveTexts[i];
+        private void RenderGroupedText(float deltaTime, RingBuffer<GroupedTextRenderState> buffer, in TextGroupSettings settings, bool allowRendering) {
+            if (!allowRendering && deltaTime <= 0) {
+                return;
+            }
 
-                if (deltaTime > 0) {
-                    state.State.Duration -= deltaTime;
-                    if (state.State.Duration <= 0) {
-                        s_ActiveTexts.FastRemoveAt(i);
+            StringBuilder sb = s_GroupedTextBuilder;
+            sb.Clear();
+
+            int screenW = Screen.width, screenH = Screen.height;
+            for (int i = 0, len = buffer.Count; i < len; i++) {
+                ref GroupedTextRenderState state = ref buffer[i];
+
+                if (allowRendering) {
+                    bool requiresColorTag = !Colors.Equals32(state.Color, settings.Color);
+                    if (requiresColorTag) {
+                        sb.Append("<color=#")
+                            .Append(StringUtils.HexCharsUpper[state.Color.r / 16]).Append(StringUtils.HexCharsUpper[state.Color.r % 16])
+                            .Append(StringUtils.HexCharsUpper[state.Color.g / 16]).Append(StringUtils.HexCharsUpper[state.Color.g % 16])
+                            .Append(StringUtils.HexCharsUpper[state.Color.b / 16]).Append(StringUtils.HexCharsUpper[state.Color.b % 16])
+                            .Append('>');
                     }
+                    sb.Append(state.Text.String, 0, state.Text.Length);
+                    if (requiresColorTag) {
+                        sb.Append("</color>");
+                    }
+
+                    sb.Append('\n');
                 }
+            }
+
+            if (allowRendering && sb.Length > 0) {
+                sb.TrimEnd(StringUtils.DefaultNewLineChars);
+
+                Vector2 targetPoint;
+
+                targetPoint = new Vector2(settings.Position.x * screenW, settings.Position.y * screenH);
+
+                targetPoint.y = screenH - targetPoint.y;
+                targetPoint.x += settings.Offset.x;
+                targetPoint.y -= settings.Offset.y;
+
+                GUIStyle style;
+                switch (settings.Style) {
+                    case DebugTextStyle.BackgroundDark: {
+                            style = m_TextStyleBox;
+                            GUI.backgroundColor = Color.black.WithAlpha(0.7f);
+                            break;
+                        }
+                    case DebugTextStyle.BackgroundDarkOpaque: {
+                            style = m_TextStyleBox;
+                            GUI.backgroundColor = Color.black;
+                            break;
+                        }
+                    case DebugTextStyle.BackgroundLight: {
+                            style = m_TextStyleBox;
+                            GUI.backgroundColor = Color.white.WithAlpha(0.7f);
+                            break;
+                        }
+                    case DebugTextStyle.BackgroundLightOpaque: {
+                            style = m_TextStyleBox;
+                            GUI.backgroundColor = Color.white;
+                            break;
+                        }
+                    default: {
+                            style = m_TextStylePlain;
+                            break;
+                        }
+                }
+
+                style.alignment = settings.Alignment;
+
+                DebugString debugStr = AllocDebugString(sb);
+
+                m_TextContent.text = debugStr.String;
+
+                Vector2 size = style.CalcSize(m_TextContent);
+
+                switch (settings.Alignment) {
+                    case TextAnchor.UpperCenter:
+                    case TextAnchor.MiddleCenter:
+                    case TextAnchor.LowerCenter: {
+                            targetPoint.x -= size.x / 2;
+                            break;
+                        }
+
+                    case TextAnchor.UpperRight:
+                    case TextAnchor.MiddleRight:
+                    case TextAnchor.LowerRight: {
+                            targetPoint.x -= size.x;
+                            break;
+                        }
+                }
+
+                switch (settings.Alignment) {
+                    case TextAnchor.MiddleLeft:
+                    case TextAnchor.MiddleCenter:
+                    case TextAnchor.MiddleRight: {
+                            targetPoint.y -= size.y / 2;
+                            break;
+                        }
+
+                    case TextAnchor.LowerLeft:
+                    case TextAnchor.LowerCenter:
+                    case TextAnchor.LowerRight: {
+                            targetPoint.y -= size.y;
+                            break;
+                        }
+                }
+
+                GUI.contentColor = settings.Color;
+                GUI.Label(new Rect((int)targetPoint.x, (int)targetPoint.y, (int)size.x, (int)size.y), m_TextContent, style);
+
+                TryFreeDebugString(debugStr);
+            }
+
+            if (deltaTime > 0) {
+                DecayTextForBuffer(deltaTime, buffer);
+            }
+        }
+
+        static private void DecayText(float deltaTime) {
+            if (deltaTime <= 0) {
+                return;
+            }
+
+            DecayTextForBuffer(deltaTime, s_ActiveTexts);
+            DecayTextForBuffer(deltaTime, s_ActiveLogTexts);
+        }
+
+        static private void DecayTextForBuffer(float deltaTime, RingBuffer<TextRenderState> buffer) {
+            for (int i = buffer.Count - 1; i >= 0; i--) {
+                ref TextRenderState state = ref buffer[i];
+
+                state.State.Duration -= deltaTime;
+                if (state.State.Duration <= 0) {
+                    TryFreeDebugString(state.Text);
+                    buffer.FastRemoveAt(i);
+                }
+            }
+        }
+
+        static private void DecayTextForBuffer(float deltaTime, RingBuffer<GroupedTextRenderState> buffer) {
+            bool updated = false;
+            
+            for (int i = buffer.Count - 1; i >= 0; i--) {
+                ref GroupedTextRenderState state = ref buffer[i];
+
+                state.State.Duration -= deltaTime;
+                if (state.State.Duration <= 0) {
+                    TryFreeDebugString(state.Text);
+                    buffer.FastRemoveAt(i);
+                    updated = true;
+                }
+            }
+
+            if (updated && buffer.Count > 1) {
+                buffer.Sort();
             }
         }
 
@@ -488,7 +795,27 @@ namespace FieldDay.Debugging {
             renderState.Params.Category = (sbyte) category;
             renderState.State.Duration = duration;
             renderState.WorldSpace = true;
-            renderState.Text = text;
+            renderState.Text = AllocDebugString(text);
+            renderState.Position = point;
+            renderState.Alignment = alignment;
+            renderState.Style = style;
+            s_ActiveTexts.PushBack(renderState);
+#endif // DEVELOPMENT && !SKIP_ONGUI
+        }
+
+        /// <summary>
+        /// Adds text, pinned to a world-space point, to the debug render queue.
+        /// </summary>
+        [Conditional("DEVELOPMENT"), Conditional("UNITY_EDITOR"), Conditional("DEVELOPMENT_BUILD")]
+        static public void AddWorldText(Vector3 point, StringBuilder text, Color color, float duration = 0, TextAnchor alignment = TextAnchor.MiddleCenter, DebugTextStyle style = DebugTextStyle.Default, int category = -1) {
+#if DEVELOPMENT && !SKIP_ONGUI
+            TextRenderState renderState = new TextRenderState();
+            renderState.Params.Color = color;
+            renderState.Params.DepthTest = false;
+            renderState.Params.Category = (sbyte) category;
+            renderState.State.Duration = duration;
+            renderState.WorldSpace = true;
+            renderState.Text = AllocDebugString(text);
             renderState.Position = point;
             renderState.Alignment = alignment;
             renderState.Style = style;
@@ -508,7 +835,28 @@ namespace FieldDay.Debugging {
             renderState.Params.Category = (sbyte) category;
             renderState.State.Duration = duration;
             renderState.WorldSpace = true;
-            renderState.Text = text;
+            renderState.Text = AllocDebugString(text);
+            renderState.Position = point;
+            renderState.Offset = offset;
+            renderState.Alignment = alignment;
+            renderState.Style = style;
+            s_ActiveTexts.PushBack(renderState);
+#endif // DEVELOPMENT && !SKIP_ONGUI
+        }
+
+        /// <summary>
+        /// Adds text, pinned to a world-space point, to the debug render queue.
+        /// </summary>
+        [Conditional("DEVELOPMENT"), Conditional("UNITY_EDITOR"), Conditional("DEVELOPMENT_BUILD")]
+        static public void AddWorldText(Vector3 point, Vector2 offset, StringBuilder text, Color color, float duration = 0, TextAnchor alignment = TextAnchor.MiddleCenter, DebugTextStyle style = DebugTextStyle.Default, int category = -1) {
+#if DEVELOPMENT && !SKIP_ONGUI
+            TextRenderState renderState = new TextRenderState();
+            renderState.Params.Color = color;
+            renderState.Params.DepthTest = false;
+            renderState.Params.Category = (sbyte) category;
+            renderState.State.Duration = duration;
+            renderState.WorldSpace = true;
+            renderState.Text = AllocDebugString(text);
             renderState.Position = point;
             renderState.Offset = offset;
             renderState.Alignment = alignment;
@@ -529,7 +877,27 @@ namespace FieldDay.Debugging {
             renderState.Params.Category = (sbyte) category;
             renderState.State.Duration = duration;
             renderState.WorldSpace = false;
-            renderState.Text = text;
+            renderState.Text = AllocDebugString(text);
+            renderState.Position = viewport;
+            renderState.Alignment = alignment;
+            renderState.Style = style;
+            s_ActiveTexts.PushBack(renderState);
+#endif // DEVELOPMENT && !SKIP_ONGUI
+        }
+
+        /// <summary>
+        /// Adds text, pinned to a viewport point, to the debug render queue.
+        /// </summary>
+        [Conditional("DEVELOPMENT"), Conditional("UNITY_EDITOR"), Conditional("DEVELOPMENT_BUILD")]
+        static public void AddViewportText(Vector2 viewport, StringBuilder text, Color color, float duration = 0, TextAnchor alignment = TextAnchor.MiddleCenter, DebugTextStyle style = DebugTextStyle.Default, int category = -1) {
+#if DEVELOPMENT && !SKIP_ONGUI
+            TextRenderState renderState = new TextRenderState();
+            renderState.Params.Color = color;
+            renderState.Params.DepthTest = false;
+            renderState.Params.Category = (sbyte) category;
+            renderState.State.Duration = duration;
+            renderState.WorldSpace = false;
+            renderState.Text = AllocDebugString(text);
             renderState.Position = viewport;
             renderState.Alignment = alignment;
             renderState.Style = style;
@@ -549,12 +917,63 @@ namespace FieldDay.Debugging {
             renderState.Params.Category = (sbyte) category;
             renderState.State.Duration = duration;
             renderState.WorldSpace = false;
-            renderState.Text = text;
+            renderState.Text = AllocDebugString(text);
             renderState.Position = viewport;
             renderState.Offset = offset;
             renderState.Alignment = alignment;
             renderState.Style = style;
             s_ActiveTexts.PushBack(renderState);
+#endif // DEVELOPMENT && !SKIP_ONGUI
+        }
+
+        /// <summary>
+        /// Adds text, pinned to a viewport point, to the debug render queue.
+        /// </summary>
+        [Conditional("DEVELOPMENT"), Conditional("UNITY_EDITOR"), Conditional("DEVELOPMENT_BUILD")]
+        static public void AddViewportText(Vector2 viewport, Vector2 offset, StringBuilder text, Color color, float duration = 0, TextAnchor alignment = TextAnchor.MiddleCenter, DebugTextStyle style = DebugTextStyle.Default, int category = -1) {
+#if DEVELOPMENT && !SKIP_ONGUI
+            TextRenderState renderState = new TextRenderState();
+            renderState.Params.Color = color;
+            renderState.Params.DepthTest = false;
+            renderState.Params.Category = (sbyte) category;
+            renderState.State.Duration = duration;
+            renderState.WorldSpace = false;
+            renderState.Text = AllocDebugString(text);
+            renderState.Position = viewport;
+            renderState.Offset = offset;
+            renderState.Alignment = alignment;
+            renderState.Style = style;
+            s_ActiveTexts.PushBack(renderState);
+#endif // DEVELOPMENT && !SKIP_ONGUI
+        }
+
+        /// <summary>
+        /// Adds text, drawn within the log panel, to the debug render queue.
+        /// </summary>
+        [Conditional("DEVELOPMENT"), Conditional("UNITY_EDITOR"), Conditional("DEVELOPMENT_BUILD")]
+        static public void AddLogText(string text, Color color, float duration = 0) {
+#if DEVELOPMENT && !SKIP_ONGUI
+            GroupedTextRenderState renderState = new GroupedTextRenderState();
+            renderState.Color = color;
+            renderState.State.Duration = duration;
+            renderState.Text = AllocDebugString(text);
+            renderState.Index = s_LogIndex++;
+            s_ActiveLogTexts.PushBack(renderState);
+#endif // DEVELOPMENT && !SKIP_ONGUI
+        }
+
+        /// <summary>
+        /// Adds text, drawn within the log panel, to the debug render queue.
+        /// </summary>
+        [Conditional("DEVELOPMENT"), Conditional("UNITY_EDITOR"), Conditional("DEVELOPMENT_BUILD")]
+        static public void AddLogText(StringBuilder text, Color color, float duration = 0) {
+#if DEVELOPMENT && !SKIP_ONGUI
+            GroupedTextRenderState renderState = new GroupedTextRenderState();
+            renderState.Color = color;
+            renderState.State.Duration = duration;
+            renderState.Text = AllocDebugString(text);
+            renderState.Index = s_LogIndex++;
+            s_ActiveLogTexts.PushBack(renderState);
 #endif // DEVELOPMENT && !SKIP_ONGUI
         }
 

@@ -10,7 +10,7 @@ using UnityEngine;
 namespace FieldDay.Editor {
     [CustomPropertyDrawer(typeof(AssetNameAttribute), true)]
     public class AssetNamePropertyDrawer : PropertyDrawer {
-        private const double RebuildCacheDelay = 150;
+        private const double RebuildCacheDelay = 15;
 
         private struct SimpleCacheEntry {
             public double LastUpdateTime;
@@ -52,7 +52,7 @@ namespace FieldDay.Editor {
                 items = new Dictionary<StringHash32, UnityEngine.Object>(all.Length, CompareUtils.DefaultEquals<StringHash32>());
             }
 
-            Debug.Log("[AssetNameAttributePropertyDrawer] Rebuilding cache for asset type " + type.Name);
+            Console.WriteLine("[AssetNameAttributePropertyDrawer] Rebuilding cache for asset type " + type.Name);
 
             foreach(var asset in all) {
                 StringHash32 key = new StringHash32(asset.name);
@@ -71,7 +71,7 @@ namespace FieldDay.Editor {
                 items = new NamedItemList<string>(simpleCache.Count + 1);
             }
 
-            items.Add(string.Empty, "[Null]", -1);
+            items.Add(string.Empty, attr.DropdownNullName ?? "[Null]", -1);
 
             foreach(var obj in simpleCache.Values) {
                 if (!attr.Predicate(obj)) {

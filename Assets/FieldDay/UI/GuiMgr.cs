@@ -1,13 +1,18 @@
-using System;
-using System.Collections.Generic;
-using System.Runtime.CompilerServices;
+using BeauPools;
 using BeauUtil;
 using BeauUtil.Debugger;
 using FieldDay.HID;
 using FieldDay.Pipes;
 using FieldDay.Rendering;
+using FieldDay.SharedState;
+using FieldDay.UI.Animation;
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using Unity.IL2CPP.CompilerServices;
 using UnityEngine;
 using UnityEngine.UI;
+using ModuleIndex = BeauUtil.TypeIndex<FieldDay.UI.IGuiModule>;
 using PanelIndex = BeauUtil.TypeIndex<FieldDay.UI.IGuiPanel>;
 
 namespace FieldDay.UI {
@@ -15,8 +20,19 @@ namespace FieldDay.UI {
     /// Interface manager.
     /// </summary>
     public sealed class GuiMgr {
+        #region Config
+
+        [Serializable]
+        public struct Config {
+            public GuiFader FaderPrefab;
+        }
+
+        #endregion // Config
+
         private ISharedGuiPanel[] m_SharedPanelMap = new ISharedGuiPanel[PanelIndex.Capacity];
         private readonly HashSet<IGuiPanel> m_PanelSet = new HashSet<IGuiPanel>(32);
+
+        private IGuiModule[] m_ModuleMap = new IGuiModule[ModuleIndex.Capacity];
 
         private readonly Dictionary<StringHash32, RectTransform> m_NamedElementMap = new Dictionary<StringHash32, RectTransform>(16, CompareUtils.DefaultEquals<StringHash32>());
 
@@ -25,10 +41,25 @@ namespace FieldDay.UI {
 
         private InputMgr m_InputMgr;
         private Camera m_PrimaryUICamera;
+        private CameraOverlayLayer m_GlobalOverlay;
 
-        internal GuiMgr(InputMgr inputMgr) {
+        private readonly PrefabPool<GuiFader> m_FaderPool;
+
+        internal GuiMgr(Config config, InputMgr inputMgr) {
             Assert.NotNull(inputMgr);
             m_InputMgr = inputMgr;
+
+            GuiFader faderPrefab = config.FaderPrefab;
+            if (faderPrefab == null) {
+                faderPrefab = GuiFader.ConstructPrefab(Game.Memory.PersistentPrefabPoolRoot);
+                faderPrefab.gameObject.SetActive(false);
+            }
+
+            m_GlobalOverlay = CameraOverlayLayer.Create();
+            m_GlobalOverlay.SetupGlobal();
+
+            m_FaderPool = new PrefabPool<GuiFader>(32, faderPrefab, Game.Memory.PersistentPrefabPoolRoot, null, false, true);
+            m_FaderPool.Prewarm(16);
         }
 
         #region Gui Camera
@@ -76,6 +107,26 @@ namespace FieldDay.UI {
 
         #endregion // Gui Camera
 
+        #region Overlays
+
+        /// <summary>
+        /// Global overlay layer.
+        /// </summary>
+        public CameraOverlayLayer GlobalOverlay {
+            get { return m_GlobalOverlay; }
+        }
+
+        /// <summary>
+        /// Allocates a fader.
+        /// </summary>
+        public TempAlloc<GuiFader> AllocFader(CameraOverlayLayer layer) {
+            TempAlloc<GuiFader> faderAlloc = m_FaderPool.TempAlloc();
+            layer.AddChild(faderAlloc.Object.transform);
+            return faderAlloc;
+        }
+
+        #endregion // Overlays
+
         #region Add/Remove
 
         #region Panels
@@ -120,6 +171,43 @@ namespace FieldDay.UI {
         }
 
         #endregion // Panels
+
+        #region Modules
+
+        /// <summary>
+        /// Registers the given gui module.
+        /// </summary>
+        public void RegisterModule(IGuiModule module) {
+            Assert.NotNull(module);
+
+            Type moduleType = module.GetType();
+            int index = ModuleIndex.Get(moduleType);
+
+            Assert.True(m_ModuleMap[index] == null, "[GuiMgr] Module of type '{0}' already registered", moduleType);
+            m_ModuleMap[index] = module;
+
+            RegistrationCallbacks.InvokeRegister(module);
+            Log.Msg("[GuiMgr] Module '{0}' registered", moduleType.FullName);
+        }
+
+        /// <summary>
+        /// Deregisters the given ISharedState instance.
+        /// </summary>
+        public void DeregisterModule(IGuiModule module) {
+            Assert.NotNull(module);
+
+            Type moduleType = module.GetType();
+            int index = ModuleIndex.Get(moduleType);
+
+            if (m_ModuleMap[index] == module) {
+                m_ModuleMap[index] = null;
+
+                RegistrationCallbacks.InvokeDeregister(module);
+                Log.Msg("[GuiMgr] Module '{0}' deregistered", moduleType.FullName);
+            }
+        }
+
+        #endregion // Modules
 
         #region Named
 
@@ -223,14 +311,16 @@ namespace FieldDay.UI {
                 Assert.Fail("No shared panel object found for type '{0}'", typeof(T).FullName);
             }
 #endif // DEVELOPMENT
-            return (T) panel;
+            return Unsafe.FastCast<T>(panel);
         }
 
         /// <summary>
         /// Fast unchecked retrieve.
         /// </summary>
+        [Il2CppSetOption(Option.ArrayBoundsChecks, false)]
+        [Il2CppSetOption(Option.NullChecks, false)]
         internal T FastGetShared<T>() where T : class, ISharedGuiPanel {
-            return (T) m_SharedPanelMap[PanelIndex.Get<T>()];
+            return Unsafe.FastCast<T>(m_SharedPanelMap[PanelIndex.Get<T>()]);
         }
 
         /// <summary>
@@ -298,6 +388,116 @@ namespace FieldDay.UI {
 
         #endregion // Shared
 
+        #region Module
+
+        /// <summary>
+        /// Returns the shared module object of the given type.
+        /// This will assert if none is found.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public IGuiModule GetModule(Type type) {
+            int index = ModuleIndex.Get(type);
+            IGuiModule module = m_ModuleMap[index];
+#if DEVELOPMENT
+            if (module == null) {
+                Assert.Fail("No shared module object found for type '{0}'", type.FullName);
+            }
+#endif // DEVELOPMENT
+            return module;
+        }
+
+        /// <summary>
+        /// Returns the module for the given type.
+        /// This will assert if none is found.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public T GetModule<T>() where T : class, IGuiModule {
+            int index = ModuleIndex.Get<T>();
+            IGuiModule module = m_ModuleMap[index];
+#if DEVELOPMENT
+            if (module == null) {
+                Assert.Fail("No module object found for type '{0}'", typeof(T).FullName);
+            }
+#endif // DEVELOPMENT
+            return Unsafe.FastCast<T>(module);
+        }
+
+        /// <summary>
+        /// Fast unchecked retrieve.
+        /// </summary>
+        [Il2CppSetOption(Option.ArrayBoundsChecks, false)]
+        [Il2CppSetOption(Option.NullChecks, false)]
+        internal T FastGetModule<T>() where T : class, IGuiModule {
+            return Unsafe.FastCast<T>(m_ModuleMap[ModuleIndex.Get<T>()]);
+        }
+
+        /// <summary>
+        /// Attempts to return the module for the given type.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryGetModule(Type type, out IGuiModule module) {
+            int index = ModuleIndex.Get(type);
+            module = index < m_ModuleMap.Length ? m_ModuleMap[index] : null;
+            return module != null;
+        }
+
+        /// <summary>
+        /// Attempts to return the module for the given type.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryGetModule<T>(out T module) where T : class, IGuiModule {
+            int index = ModuleIndex.Get<T>();
+            module = (T)(index < m_ModuleMap.Length ? m_ModuleMap[index] : null);
+            return module != null;
+        }
+
+        /// <summary>
+        /// Looks up all modules that pass the given predicate.
+        /// </summary>
+        public int LookupModuleAll(Predicate<IGuiModule> predicate, List<IGuiModule> modules) {
+            int found = 0;
+            for(int i = 0; i < ModuleIndex.Count; i++) {
+                IGuiModule module = m_ModuleMap[i];
+                if (module != null && predicate(module)) {
+                    modules.Add(module);
+                    found++;
+                }
+            }
+            return found;
+        }
+
+        /// <summary>
+        /// Looks up all modules that implement the given interface or class.
+        /// </summary>
+        public int LookupModuleAll<T>(List<T> modules) where T : class {
+            int found = 0;
+            for (int i = 0; i < ModuleIndex.Count; i++) {
+                T casted = m_ModuleMap[i] as T;
+                if (casted != null) {
+                    modules.Add(casted);
+                    found++;
+                }
+            }
+            return found;
+        }
+
+        /// <summary>
+        /// Looks up all modules that pass the given predicate.
+        /// </summary>
+        public int LookupModuleAll<U>(Predicate<IGuiModule, U> predicate, U predicateArg, List<IGuiModule> modules) {
+            int found = 0;
+            for (int i = 0; i < ModuleIndex.Count; i++) {
+                IGuiModule module = m_ModuleMap[i];
+                if (module != null && predicate(module, predicateArg)) {
+                    modules.Add(module);
+                    found++;
+                }
+            }
+            return found;
+        }
+
+        #endregion // Module
+
         #region Named
 
         /// <summary>
@@ -314,6 +514,7 @@ namespace FieldDay.UI {
 
         #region Commands
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void QueueCommand(GuiCommandData cmd) {
             m_Commands.Write(cmd);
         }
@@ -321,23 +522,23 @@ namespace FieldDay.UI {
         internal void ExecuteCommand(ref GuiCommandData cmd) {
             switch (cmd.Type) {
                 case GuiCommandType.SetActive_GO: {
-                    ((GameObject) cmd.Target).SetActive(cmd.Arg.Bool);
+                    Unsafe.FastCast<GameObject>(cmd.Target).SetActive(cmd.Arg.Bool);
                     break;
                 }
                 case GuiCommandType.SetActive_Behaviour: {
-                    ((Behaviour) cmd.Target).enabled = cmd.Arg.Bool;
+                    Unsafe.FastCast<Behaviour>(cmd.Target).enabled = cmd.Arg.Bool;
                     break;
                 }
                 case GuiCommandType.SetActive_ActiveGroup: {
-                    ((ActiveGroup) cmd.Target).SetActive(cmd.Arg.Bool);
+                    Unsafe.FastCast<ActiveGroup>(cmd.Target).SetActive(cmd.Arg.Bool);
                     break;
                 }
                 case GuiCommandType.TryClick_GO: {
-                    Game.Input.ExecuteClick((GameObject) cmd.Target);
+                    Game.Input.ExecuteClick(Unsafe.FastCast<GameObject>(cmd.Target));
                     break;
                 }
                 case GuiCommandType.ForceClick_GO: {
-                    Game.Input.ForceClick((GameObject) cmd.Target);
+                    Game.Input.ForceClick(Unsafe.FastCast<GameObject>(cmd.Target));
                     break;
                 }
                 case GuiCommandType.ExecuteAction_Void: {
@@ -382,6 +583,27 @@ namespace FieldDay.UI {
                     group.enabled = false;
                     break;
                 }
+                case GuiCommandType.TryFreePrefab_GO: {
+                    GameObject prefab = Unsafe.FastCast<GameObject>(cmd.Target);
+                    if (!Pool.TryFree(prefab)) {
+                        Log.Warn("[GuiMgr] Unable to free prefab '{0}' - destroying", prefab.name);
+                        UnityHelper.SafeDestroyGO(ref prefab);
+                    }
+                    break;
+                }
+                case GuiCommandType.TryFreePrefab_Component: {
+                    Component prefab = (Component) cmd.Target;
+                    if (!Pool.TryFree(prefab)) {
+                        Log.Warn("[GuiMgr] Unable to free prefab '{0}' - destroying", prefab.name);
+                        UnityHelper.SafeDestroyGO(ref prefab);
+                    }
+                    break;
+                }
+                case GuiCommandType.PoolFree_Object: {
+                    IPool pool = (IPool) cmd.Target;
+                    pool.Free(cmd.ArgObject);
+                    break;
+                }
             }
         }
 
@@ -409,6 +631,8 @@ namespace FieldDay.UI {
 
         internal void Shutdown() {
             Array.Clear(m_SharedPanelMap, 0, m_SharedPanelMap.Length);
+            Array.Clear(m_ModuleMap, 0, m_ModuleMap.Length);
+            m_FaderPool.Dispose();
             m_PanelSet.Clear();
             m_NamedElementMap.Clear();
             m_UpdateCallbacks.Clear();
