@@ -2,8 +2,6 @@
 #define DEVELOPMENT
 #endif // UNITY_EDITOR || DEVELOPMENT_BUILD
 
-#define FIELD_DAY_TESTS
-
 using BeauRoutine;
 using BeauUtil;
 using BeauUtil.Debugger;
@@ -60,7 +58,9 @@ namespace FieldDay.Debugging {
             }
         }
 
+#if DEVELOPMENT
         static private readonly string[] CachedSmokeTestStateStrings = ReflectionCache.EnumInfo<SmokeTestState>().InspectorNames;
+#endif // DEVELOPMENT
 
         static private Action s_Reset;
         static private readonly RingBuffer<SmokeTestData> s_ScheduledTests = new RingBuffer<SmokeTestData>(MaxTests, RingBufferMode.Fixed);
@@ -169,10 +169,12 @@ namespace FieldDay.Debugging {
             }
 
             if (s_TestState >= SmokeTestState.Running) {
+#if DEVELOPMENT
                 s_DebugBuilder.Append("CURRENT TEST: ").Append(test.Name)
                     .Append("\nSTATE: ").Append(CachedSmokeTestStateStrings[(int) s_TestState]);
-                DebugDraw.AddViewportText(new Vector2(0.5f, 0), new Vector2(0, 16), s_DebugBuilder, Color.black, 0, TextAnchor.LowerCenter, DebugTextStyle.BackgroundDarkOpaque);
+                DebugDraw.AddViewportText(new Vector2(0.5f, 0), new Vector2(0, 16), s_DebugBuilder, Color.green, 0, TextAnchor.LowerCenter, DebugTextStyle.BackgroundDarkOpaque);
                 s_DebugBuilder.Clear();
+#endif // DEVELOPMENT
             }
         }
 
@@ -311,7 +313,7 @@ namespace FieldDay.Debugging {
         static public void ScheduleTest(string testName) {
 #if FIELD_DAY_TESTS
             Assert.NotNull(testName);
-            int existingTestIdx = s_NamedSmokeTests.FindIndex((a, b) => a.Name.Equals(b, StringComparison.Ordinal), testName);
+            int existingTestIdx = s_NamedSmokeTests.FindIndex((a, b) => a.Name.Equals(b, StringComparison.OrdinalIgnoreCase), testName);
             Assert.True(existingTestIdx >= 0, "Smoke Test with name '{0}' not registered", testName);
             ScheduleTest(s_NamedSmokeTests[existingTestIdx]);
 #endif // FIELD_DAY_TESTS
@@ -324,7 +326,7 @@ namespace FieldDay.Debugging {
         static public void RegisterTest(in SmokeTestData testData) {
 #if FIELD_DAY_TESTS
             Assert.NotNull(testData.Name);
-            int existingTestIdx = s_NamedSmokeTests.FindIndex((a, b) => a.Name.Equals(b, StringComparison.Ordinal), testData.Name);
+            int existingTestIdx = s_NamedSmokeTests.FindIndex((a, b) => a.Name.Equals(b, StringComparison.OrdinalIgnoreCase), testData.Name);
             Assert.True(existingTestIdx < 0, "Smoke Test with name '{0}' already registered", testData.Name);
             s_NamedSmokeTests.PushBack(testData);
 #endif // FIELD_DAY_TESTS
@@ -339,13 +341,18 @@ namespace FieldDay.Debugging {
         [EngineMenuFactory]
         static private DMInfo CreateDebugMenu() {
             DMInfo menu = new DMInfo("Smoke Tests", 64);
-            foreach(var testRegistration in Reflect.FindMethods<SmokeTestProviderAttribute>(ReflectionCache.UserAssemblies, System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.NonPublic, false)) {
+            foreach(var testRegistration in Reflect.FindMethods<SmokeTestProviderAttribute>(ReflectionCache.UserAssemblies, System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic, false)) {
                 MethodInfo m = testRegistration.Info;
                 if (m.ReturnParameter.ParameterType != typeof(void) || m.GetParameters().Length != 0) {
                     UnityEngine.Debug.LogErrorFormat("[SmokeTestMgr] Method '{0}::{1}' does not match required signature of 'void func()'", m.DeclaringType.FullName, m.Name);
                 } else {
                     m.Invoke(null, Array.Empty<object>());
                 }
+            }
+
+            foreach(var named in s_NamedSmokeTests) {
+                string name = named.Name;
+                menu.AddButton(name, () => ScheduleTest(name));
             }
 
             return menu;

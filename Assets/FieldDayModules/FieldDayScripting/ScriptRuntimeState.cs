@@ -1,20 +1,23 @@
-using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.Runtime.CompilerServices;
-using System.Threading;
 using BeauPools;
 using BeauRoutine;
 using BeauUtil;
 using BeauUtil.Debugger;
 using BeauUtil.Tags;
 using BeauUtil.Variants;
+using FieldDay.Data;
 using FieldDay.Debugging;
+using FieldDay.Localization;
 using FieldDay.Scenes;
 using FieldDay.SharedState;
 using FieldDay.Vox;
 using Leaf;
 using Leaf.Runtime;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using Unity.IL2CPP.CompilerServices;
 using UnityEngine;
 
@@ -31,6 +34,9 @@ namespace FieldDay.Scripting {
         // Actor Tracking
         internal readonly ScriptActorMap<ScriptActor> Actors = new ScriptActorMap<ScriptActor>(16);
 
+        // Signals
+        internal readonly EventDispatcher<Variant> SignalMap = new EventDispatcher<Variant>(8, 8, 4);
+
         // Plugin
         internal ScriptPlugin Plugin;
         internal MethodCache<LeafMember> MethodCache;
@@ -38,17 +44,27 @@ namespace FieldDay.Scripting {
         // Tag String
         internal CustomTagParserConfig TagParserConfig;
         internal TagStringEventHandler TagEventHandler;
-        internal HashSet<StringHash32> SkippableTagEvents;
-        internal HashSet<StringHash32> TextOutputTagEvents;
+
+        internal HashSet<StringHash32> SkippableTagEvents = new HashSet<StringHash32>(16);
+        internal HashSet<StringHash32> TagEventsContainingText = new HashSet<StringHash32>(8);
+        
         internal TagStringParser TagParser;
+
+        // Printers
+        internal readonly Dictionary<StringHash32, IDialoguePrinter> PrinterMap = MapUtils.Create<StringHash32, IDialoguePrinter>(4);
+        internal readonly Dictionary<StringHash32, IDialogueChoicePresenter> ChoicePresenterMap = MapUtils.Create<StringHash32, IDialogueChoicePresenter>(4);
+        internal StringHash32 DefaultPrinterId;
+
+        // Flags
+        internal ScriptRuntimeConfigFlags Flags;
 
         // Pools
         internal IPool<ScriptThread> ThreadPool;
         internal IPool<VariantTable> TablePool;
 
         // Variable Resolvers
-        internal CustomVariantResolver Resolver;
-        internal CustomVariantResolver ResolverOverride;
+        internal VariantTableResolver Resolver;
+        internal VariantTableResolver ResolverOverride;
 
         // Randomization
         internal System.Random Random = new System.Random();
@@ -73,6 +89,8 @@ namespace FieldDay.Scripting {
         #region Callbacks
 
         public readonly CastableEvent<ScriptThread, TagString> OnTaggedLineProcessed = new CastableEvent<ScriptThread, TagString>();
+        public readonly CastableEvent<ScriptThread, LeafChoice> OnLeafChoicePresented = new CastableEvent<ScriptThread, LeafChoice>();
+        public readonly CastableEvent<ScriptThread, LeafChoice> OnLeafChoiceChosen = new CastableEvent<ScriptThread, LeafChoice>();
 
         #endregion // Callbacks
 
@@ -83,10 +101,10 @@ namespace FieldDay.Scripting {
         }
 
         void IRegistrationCallbacks.OnRegister() {
-            Resolver = new CustomVariantResolver();
+            Resolver = new VariantTableResolver(8);
             MethodCache = LeafUtils.CreateMethodCache(typeof(IScriptActorComponent));
 
-            ResolverOverride = new CustomVariantResolver();
+            ResolverOverride = new VariantTableResolver(2);
             ResolverOverride.Base = Resolver;
 
             TagParserConfig = new CustomTagParserConfig();
@@ -121,6 +139,9 @@ namespace FieldDay.Scripting {
             Game.Scenes.OnMainSceneLateEnable.Register(() => {
                 SceneLocalTable.Clear();
             });
+            Game.Scenes.OnMainSceneUnloaded.Register(() => {
+                SignalMap.CleanupDeadReferences();
+            });
 
             Game.Scenes.QueueOnEnable(InitialMethodCache);
 
@@ -132,9 +153,13 @@ namespace FieldDay.Scripting {
                 }
                 SceneLocalTable.Clear();
             });
+
+            if (!EngineHints.GetHintBool("VOX_ENABLED", true)) {
+                Flags &= ScriptRuntimeConfigFlags.VoiceoverAllLinesByDefault;
+                ScriptUtility.DB.AutoLoadCustomLineNamesIntoVox = false;
+            }
         }
-        // TODO: Figure out why this needs to be called later in the scene loading process
-        // when in WebGL. Also why LoadStaticAsync is broken
+
         private void InitialMethodCache() {
             MethodCache.Load(typeof(ScriptActor));
             MethodCache.LoadStatic();
@@ -150,6 +175,12 @@ namespace FieldDay.Scripting {
         }
 
         #endregion // ISceneLoadDependency
+    }
+
+    [Flags]
+    internal enum ScriptRuntimeConfigFlags : uint {
+        VoiceoverAllLinesByDefault = 0x01,
+        UseDialogBoxByDefault = 0x02
     }
 
     internal struct QueuedScriptEvent {
@@ -188,8 +219,8 @@ namespace FieldDay.Scripting {
         static private void Initialize() {
             Game.SharedState.Register(new ScriptDatabase());
             Game.SharedState.Register(new ScriptRuntimeState());
-            Game.Systems.Register(new ScriptLoadingSystem());
-            Game.Systems.Register(new ScriptRuntimeTickSystem());
+            ScriptLoadingSystem.RegisterModule();
+            ScriptRuntimeTickSystem.RegisterModule();
         }
 
         #region Tables
@@ -213,25 +244,11 @@ namespace FieldDay.Scripting {
         #region Variables
 
         /// <summary>
-        /// Binds a named variable to the runtime.
-        /// </summary>
-        static public void BindVariable(TableKeyPair keyPair, CustomVariantResolver.GetVarDelegate resolver) {
-            Runtime.Resolver.SetVar(keyPair, resolver);
-        }
-
-        /// <summary>
-        /// Removes a named variable from the runtime.
-        /// </summary>
-        static public void UnbindVariable(TableKeyPair keyPair) {
-            Runtime.Resolver.ClearVar(keyPair);
-        }
-
-        /// <summary>
         /// Reads the variable at the given location.
         /// </summary>
         static public Variant ReadVariable(TableKeyPair keyPair, Variant defaultVal = default) {
             Variant result;
-            if (!Runtime.Resolver.TryResolve(null, keyPair, out result)) {
+            if (!Runtime.Resolver.TryResolve(keyPair, out result)) {
                 result = defaultVal;
             }
             return result;
@@ -242,7 +259,7 @@ namespace FieldDay.Scripting {
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static public void WriteVariable(TableKeyPair keyPair, Variant value) {
-            Runtime.Resolver.TryModify(null, keyPair, VariantModifyOperator.Set, value);
+            Runtime.Resolver.TryModify(keyPair, VariantModifyOperator.Set, value);
         }
 
         #endregion // Variables
@@ -265,7 +282,125 @@ namespace FieldDay.Scripting {
             return evtData.Argument0.AsStringHash();
         }
 
+        /// <summary>
+        /// Returns the character id embedded in the given line.
+        /// </summary>
+        static public StringHash32 GetCharacterId(TagString tagString, StringHash32 defaultValue) {
+            if (!tagString.TryFindEvent(LeafUtils.Events.Character, out var evtData)) {
+                return defaultValue;
+            }
+            return evtData.Argument0.AsStringHash();
+        }
+
+        /// <summary>
+        /// Returns the character name override embedded in the given line.
+        /// </summary>
+        static public StringSlice GetCharacterNameOverride(TagString tagString) {
+            tagString.TryFindEvent(TagEvents.OverrideCharName, out var evtData);
+            return evtData.StringArgument;
+        }
+
+        /// <summary>
+        /// Returns the character state embedded in the given line.
+        /// </summary>
+        static public DialogueCharacterState GetCharacterState(TagString tagString, DialogueCharacterState baseValues) {
+            DialogueCharacterState charState = baseValues;
+            
+            int nodeIndex = 0;
+            if (tagString.EventCount > 0) {
+                for (nodeIndex = 0; nodeIndex < tagString.NodeCount; nodeIndex++) {
+                    TagNodeData node = tagString.GetNode(nodeIndex);
+                    if (node.Type != TagNodeType.Event) {
+                        break;
+                    }
+
+                    StringHash32 eventType = node.Event.Type;
+                    if (eventType == TagEvents.HasNoVox) {
+                    } else if (eventType == TagEvents.HasVox) {
+                    } else if (eventType == TagEvents.VoxOnly) {
+                    } else if (eventType == TagEvents.SetStyle) {
+                    } else if (eventType == LeafUtils.Events.Character) {
+                        charState.CharacterId = node.Event.Argument0.AsStringHash();
+                        charState.PoseId = node.Event.Argument1.AsStringHash();
+                        charState.OverrideName = null;
+                    } else if (eventType == LeafUtils.Events.Pose) {
+                        charState.PoseId = node.Event.Argument0.AsStringHash();
+                    } else if (eventType == TagEvents.OverrideCharName) {
+                        charState.OverrideName = node.Event.StringArgument.ToString();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            return charState;
+        }
+
         #endregion // Tag Parsing
+
+        #region Text Lookup
+
+        /// <summary>
+        /// Attempts to parse a line code out to a TagString.
+        /// </summary>
+        static public bool ReadText(ref TagString tagString, StringHash32 lineId, object context = null) {
+            // TODO: Implement with Loc
+            return false;
+        }
+
+        /// <summary>
+        /// Attempts to parse a line code out to a TagString.
+        /// </summary>
+        static public bool ReadText(TagString tagString, StringHash32 lineId, object context = null) {
+            // TODO: Implement with Loc
+            return false;
+        }
+
+        /// <summary>
+        /// Attempts to parse a line code out to a TagString.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public bool ReadText(ref TagString tagString, LeafThreadHandle threadContext, StringHash32 lineId, object context = null) {
+            return ReadText(ref tagString, threadContext.GetThread<ScriptThread>().PeekNode(), lineId, context);
+        }
+
+        /// <summary>
+        /// Attempts to parse a line code out to a TagString.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public bool ReadText(TagString tagString, LeafThreadHandle threadContext, StringHash32 lineId, object context = null) {
+            return ReadText(tagString, threadContext.GetThread<ScriptThread>().PeekNode(), lineId, context);
+        }
+
+        /// <summary>
+        /// Attempts to parse a line code out to a TagString.
+        /// </summary>
+        static public bool ReadText(ref TagString tagString, LeafNode nodeContext, StringHash32 lineId, object context = null) {
+            if (LeafUtils.TryLookupLine(Runtime.Plugin, lineId, nodeContext, out string line)) {
+                Runtime.TagParser.Parse(ref tagString, line, context);
+                return true;
+            }
+
+            tagString?.Clear();
+            return false;
+        }
+
+        /// <summary>
+        /// Attempts to parse a line code out to a TagString.
+        /// </summary>
+        static public bool ReadText(TagString tagString, LeafNode nodeContext, StringHash32 lineId, object context = null) {
+            Assert.NotNull(tagString);
+
+            if (LeafUtils.TryLookupLine(Runtime.Plugin, lineId, nodeContext, out string line)) {
+                Runtime.TagParser.Parse(ref tagString, line, context);
+                return true;
+            }
+
+            tagString?.Clear();
+            return false;
+        }
+
+        #endregion // Text Lookup
 
         #region Actors
 
@@ -378,6 +513,98 @@ namespace FieldDay.Scripting {
 
         #endregion // Actors
 
+        #region Dialog
+
+        /// <summary>
+        /// Default printer id.
+        /// </summary>
+        static public StringHash32 DefaultDialoguePrinterId {
+            get { return Runtime.DefaultPrinterId; }
+            set { Runtime.DefaultPrinterId = value; }
+        }
+
+        /// <summary>
+        /// Registers a dialog interface.
+        /// </summary>
+        static public void RegisterDialogueInterface<TInterface>(StringHash32 id, TInterface printerAndChoice)
+            where TInterface : class, IDialoguePrinter, IDialogueChoicePresenter {
+            Assert.NotNull(printerAndChoice);
+            RegisterDialoguePrinter(id, printerAndChoice);
+            RegisterDialogueChoicePresenter(id, printerAndChoice);
+        }
+
+        /// <summary>
+        /// Deregisters a dialog interface.
+        /// </summary>
+        static public void DeregisterDialogueInterface<TInterface>(StringHash32 id, TInterface printerAndChoice)
+            where TInterface : class, IDialoguePrinter, IDialogueChoicePresenter {
+            Assert.NotNull(printerAndChoice);
+            DeregisterDialoguePrinter(id, printerAndChoice);
+            DeregisterDialogueChoicePresenter(id, printerAndChoice);
+        }
+
+        /// <summary>
+        /// Registers a dialogue print interface.
+        /// </summary>
+        static public void RegisterDialoguePrinter(StringHash32 id, IDialoguePrinter printer) {
+            Assert.NotNull(printer);
+            Assert.False(Runtime.PrinterMap.ContainsKey(id), "DialoguePrinter with id '{0}' already registered", id.ToDebugString());
+            Runtime.PrinterMap.Add(id, printer);
+        }
+
+        /// <summary>
+        /// Deregisteres a dialogue printer interface.
+        /// </summary>
+        static public void DeregisterDialoguePrinter(StringHash32 id, IDialoguePrinter printer) {
+            Assert.NotNull(printer);
+            Assert.True(Runtime.PrinterMap.ContainsKey(id), "DialoguePrinter with id '{0}' not registered", id.ToDebugString());
+            Assert.True(Runtime.PrinterMap[id] == printer, "DialoguePrinter with id '{0}' is not registered to the given printer", id.ToDebugString());
+            Runtime.PrinterMap.Remove(id);
+        }
+
+        /// <summary>
+        /// Registers a dialogue choice interface.
+        /// </summary>
+        static public void RegisterDialogueChoicePresenter(StringHash32 id, IDialogueChoicePresenter choicePresenter) {
+            Assert.NotNull(choicePresenter);
+            Assert.False(Runtime.ChoicePresenterMap.ContainsKey(id), "DialogueChoicePresenter with id '{0}' already registered", id.ToDebugString());
+            Runtime.ChoicePresenterMap.Add(id, choicePresenter);
+        }
+
+        /// <summary>
+        /// Deregisters a dialogue choice interface.
+        /// </summary>
+        static public void DeregisterDialogueChoicePresenter(StringHash32 id, IDialogueChoicePresenter choicePresenter) {
+            Assert.NotNull(choicePresenter);
+            Assert.True(Runtime.ChoicePresenterMap.ContainsKey(id), "DialogueChoicePresenter with id '{0}' not registered", id.ToDebugString());
+            Assert.True(Runtime.ChoicePresenterMap[id] == choicePresenter, "DialogueChoicePresenter with id '{0}' is not registered to the given presenter", id.ToDebugString());
+            Runtime.ChoicePresenterMap.Remove(id);
+        }
+
+        /// <summary>
+        /// Returns the dialogue printer with the given id.
+        /// </summary>
+        static public IDialoguePrinter GetDialoguePrinter(StringHash32 id) {
+            // TODO: Handle pooled printers?
+            id = StringHash32.First(id, Runtime.DefaultPrinterId);
+            Runtime.PrinterMap.TryGetValue(id, out var printer);
+            Assert.NotNull(printer, "DialoguePrinter with id '{0}' not registered!", id.ToDebugString());
+            return printer;
+        }
+
+        /// <summary>
+        /// Returns the dialogue choice interface with the given id.
+        /// </summary>
+        static public IDialogueChoicePresenter GetDialogueChoicePresenter(StringHash32 id) {
+            // TODO: Handle pooled presenters?
+            id = StringHash32.First(id, Runtime.DefaultPrinterId);
+            Runtime.ChoicePresenterMap.TryGetValue(id, out var choicePresenter);
+            Assert.NotNull(choicePresenter, "DialogueChoicePresenter with id '{0}' not registered!", id.ToDebugString());
+            return choicePresenter;
+        }
+
+        #endregion // Dialog
+
         #region Context
 
         static private LeafEvalContext GetEvalContext(ILeafActor actor, VariantTable table) {
@@ -393,15 +620,17 @@ namespace FieldDay.Scripting {
 
         #region Functions
 
-        static public void Invoke(StringHash32 functionId, VariantTable vars = null) {
-            Invoke(functionId, default, null, vars);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public int Invoke(StringHash32 functionId, VariantTable vars = null) {
+            return Invoke(functionId, default, null, vars);
         }
 
-        static public void Invoke(StringHash32 functionId, ILeafActor actor, VariantTable vars = null) {
-            Invoke(functionId, actor?.Id ?? StringHash32.Null, actor, vars);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public int Invoke(StringHash32 functionId, ILeafActor actor, VariantTable vars = null) {
+            return Invoke(functionId, actor?.Id ?? StringHash32.Null, actor, vars);
         }
 
-        static public void Invoke(StringHash32 functionId, StringHash32 targetId, ILeafActor actor, VariantTable vars = null) {
+        static public int Invoke(StringHash32 functionId, StringHash32 targetId, ILeafActor actor, VariantTable vars = null) {
             using (PooledList<ScriptNode> funcNodes = PooledList<ScriptNode>.Create()) {
                 ScriptNodeLookupArgs lookup;
                 lookup.TargetId = targetId;
@@ -413,9 +642,10 @@ namespace FieldDay.Scripting {
                 lookup.EvalContext = GetEvalContext(actor, vars);
                 ScriptDBUtility.FindAllFunctions(DB, functionId, lookup, funcNodes);
                 foreach (var node in funcNodes) {
-                    Runtime.Plugin.Run(node, targetId, actor, vars, "Function Invokation", true);
+                    Runtime.Plugin.Run(node, targetId, actor, vars, "Function Invocation", true);
                 }
                 Log.Msg("[ScriptUtility] Invoked '{0}', {1} response(s)", functionId.ToDebugString(), funcNodes.Count.ToStringLookup());
+                return funcNodes.Count;
             }
         }
 
@@ -423,10 +653,12 @@ namespace FieldDay.Scripting {
 
         #region Trigger
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static public LeafThreadHandle Trigger(StringHash32 triggerId, VariantTable vars = null) {
             return Trigger(triggerId, default, null, vars);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static public LeafThreadHandle Trigger(StringHash32 triggerId, ILeafActor actor, VariantTable vars = null) {
             return Trigger(triggerId, actor?.Id ?? StringHash32.Null, actor, vars);
         }
@@ -455,6 +687,24 @@ namespace FieldDay.Scripting {
 
         #endregion // Trigger
 
+        #region Spawn
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public LeafThreadHandle SpawnThread(StringHash32 nodeId, VariantTable vars = null) {
+            return SpawnThread(nodeId, null, vars);
+        }
+
+        static public LeafThreadHandle SpawnThread(StringHash32 nodeId, ILeafActor actor, VariantTable vars = null) {
+            if (ScriptDBUtility.TryLookupExposedNode(DB, nodeId, out ScriptNode node)) {
+                return Runtime.Plugin.Run(node, actor?.Id ?? StringHash32.Null, actor, vars, "Spawn Directly", true);
+            }
+
+            Log.Warn("[ScriptUtility] No exposed node with id '{0}' found", nodeId.ToDebugString());
+            return default;
+        }
+
+        #endregion // Spawn
+
         #region Vox
 
         static internal VoxPriority ScriptPriorityToVoxPriority(ScriptNodePriority priority) {
@@ -464,22 +714,6 @@ namespace FieldDay.Scripting {
         #endregion // Vox
 
         #region Stopping
-
-        /// <summary>
-        /// Kills all running threads associated with the given actor.
-        /// </summary>
-        static public int KillThreads(ILeafActor actor) {
-            int killed = 0;
-            var table = Runtime.ActiveThreads;
-            for(int i = table.Count - 1; i >= 0; i--) {
-                var thread = table[i].GetThread();
-                if (thread != null && thread.Actor == actor) {
-                    table[i].Kill();
-                    killed++;
-                }
-            }
-            return killed;
-        }
 
         /// <summary>
         /// Kills all running threads.
@@ -513,6 +747,49 @@ namespace FieldDay.Scripting {
             return killed;
         }
 
+        /// <summary>
+        /// Kills all running threads associated with the given actor.
+        /// </summary>
+        static public int KillAllThreadsForActor(ILeafActor actor) {
+            int killed = 0;
+            var table = Runtime.ActiveThreads;
+            for (int i = table.Count - 1; i >= 0; i--) {
+                var thread = table[i].GetThread();
+                if (thread != null && thread.Actor == actor) {
+                    table[i].Kill();
+                    killed++;
+                }
+            }
+            return killed;
+        }
+
+        /// <summary>
+        /// Kills all running threads associated with the given target.
+        /// </summary>
+        static public int KillAllThreadsForTarget(StringHash32 targetId) {
+            int killed = 0;
+            var table = Runtime.ActiveThreads;
+            for (int i = table.Count - 1; i >= 0; i--) {
+                var thread = (ScriptThread)table[i].GetThread();
+                if (thread != null && thread.Target() == targetId) {
+                    table[i].Kill();
+                    killed++;
+                }
+            }
+            return killed;
+        }
+
+        /// <summary>
+        /// Kills the currently running thread for the given target.
+        /// </summary>
+        static public bool KillPrimaryThreadForTarget(StringHash32 targetId) {
+            if (Runtime.ActorThreadMap.Threads.TryGetValue(targetId, out var handle) && handle.IsRunning()) {
+                handle.Kill();
+                return true;
+            }
+            return false;
+        }
+
         #endregion // Stopping
 
         #region Who
@@ -542,6 +819,14 @@ namespace FieldDay.Scripting {
         static public RingBuffer<LeafThreadHandle>.Enumerator CurrentThreads {
             [Il2CppSetOption(Option.NullChecks, false)]
             get { return Runtime.ActiveThreads.GetEnumerator(); }
+        }
+
+        /// <summary>
+        /// The current number of executing threads.
+        /// </summary>
+        static public int CurrentThreadCount {
+            [Il2CppSetOption(Option.NullChecks, false)]
+            get { return Runtime.ActiveThreads.Count; }
         }
 
         /// <summary>
@@ -593,5 +878,45 @@ namespace FieldDay.Scripting {
         }
 
         #endregion // Cutscenes
+
+        #region Signals
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public void RegisterForSignal(StringHash32 signalId, Action action, UnityEngine.Object context = null) {
+            Runtime.SignalMap.Register(signalId, action, context);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public void DeregisterFromSignal(StringHash32 signalId, Action action) {
+            Runtime.SignalMap.Deregister(signalId, action);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public void RegisterForSignal(StringHash32 signalId, Action<Variant> action, UnityEngine.Object context = null) {
+            Runtime.SignalMap.Register(signalId, action, context);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public void DeregisterFromSignal(StringHash32 signalId, Action<Variant> action) {
+            Runtime.SignalMap.Deregister(signalId, action);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public void DeregisterAllSignalsForContext(UnityEngine.Object context) {
+            Runtime.SignalMap.DeregisterAllForContext(context);
+        }
+
+        [LeafMember]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public void DispatchSignal(StringHash32 eventId, Variant argument = default) {
+            Runtime.SignalMap.Dispatch(eventId, argument);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public void QueueSignal(StringHash32 eventId, Variant argument = default) {
+            Runtime.SignalMap.Queue(eventId, argument);
+        }
+
+        #endregion // Signals
     }
 }

@@ -13,7 +13,7 @@ using BeauUtil.Debugger;
 using BeauUtil.IO;
 using BeauUtil.Streaming;
 using BeauUtil.Variants;
-using FieldDay.Data;
+using FieldDay.Collections;
 using FieldDay.Debugging;
 using FieldDay.Scenes;
 using FieldDay.SharedState;
@@ -43,6 +43,8 @@ namespace FieldDay.Scripting {
 
         // unload
         internal RingBuffer<UniqueId16> UnloadQueue = new RingBuffer<UniqueId16>();
+
+        internal bool AutoLoadCustomLineNamesIntoVox;
 
         #region ISceneLoadDepencency
 
@@ -95,6 +97,9 @@ namespace FieldDay.Scripting {
 
             foreach(var package in db.RegisteredPackages) {
                 if (package.WasFromSource(asset)) {
+                    if (db.UnloadQueue.FastRemove(package.m_LoadId)) {
+                        Log.Msg("[ScriptDBUtility] Cancelled unload of {0}", package.Name());
+                    }
                     return package.m_LoadId;
                 }
             }
@@ -191,7 +196,7 @@ namespace FieldDay.Scripting {
                 }
             }
 
-            if (VoxUtility.DB != null) {
+            if (db.AutoLoadCustomLineNamesIntoVox && VoxUtility.DB != null) {
                 using (PooledList<KeyValuePair<StringHash32, string>> customLineNames = PooledList<KeyValuePair<StringHash32, string>>.Create()) {
                     package.GatherAllLinesWithCustomNames(customLineNames);
                     foreach (var kv in customLineNames) {
@@ -239,6 +244,13 @@ namespace FieldDay.Scripting {
         #region Lookups
 
         static private readonly WeightedSet<ScriptNode> s_WeightedWorkList = new WeightedSet<ScriptNode>(16);
+
+        /// <summary>
+        /// Finds a node with the given id, searching through all exposed nodes.
+        /// </summary>
+        static public bool TryLookupExposedNode(ScriptDatabase db, StringHash32 nodeId, out ScriptNode node) {
+            return db.LoadedExposedNodes.TryGetValue(nodeId, out node);
+        }
 
         /// <summary>
         /// Finds a node with the given id, searching from an existing node's scope first,

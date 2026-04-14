@@ -19,7 +19,9 @@
         "OGD.Log",
         "Unity.XR.Oculus",
         "Unity.XR.OpenXR",
-        "TinyIL.Mono"
+        "TinyIL.Mono",
+        "Unity.Timeline",
+        "NativePrefetch"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
@@ -50,9 +52,14 @@
             "define": "USING_OCULUSXR"
         },
         {
-            "name": "com.unity.modules.ui",
-            "expression": "0.0.1",
-            "define": "USING_blahsdlfjhasdf"
+            "name": "com.unity.timeline",
+            "expression": "1.7.6",
+            "define": "USING_TIMELINE"
+        },
+        {
+            "name": "com.beauprime.tinyil-mono",
+            "expression": "0.2.1",
+            "define": "USING_TINYIL"
         }
     ],
     "noEngineReferences": false

@@ -10,8 +10,9 @@ using UnityEngine;
 namespace FieldDay.Vox {
     public struct VoxRequest {
         public StringHash32 LineCode;
-        public SubtitleEntry Subtitle;
         public StringHash32 CharacterId;
+        public StringHash32 Tag;
+        public SubtitleEntry Subtitle;
         
         public VoxPriority Priority;
         public bool StartPlayback;
@@ -117,6 +118,7 @@ namespace FieldDay.Vox {
             emitter.AudioHandle = default;
 
             emitter.Player.Stop();
+            emitter.Player.clip = null;
             emitter.PlayingPriority = VoxPriority.Unassigned;
 
             if (req.UnloadAfterPlayback) {
@@ -139,10 +141,9 @@ namespace FieldDay.Vox {
                 cachedReq.OnFinish(handle, cachedReq.Emitter, cachedReq.LineCode);
             }
 
-            SubtitleUtility.RequestDismiss(new SubtitleDisplayData() {
+            SubtitleUtility.RequestDismiss(new SubtitleDismissData() {
                 CharacterId = cachedReq.Emitter.CharacterId,
-                Subtitle = cachedReq.Subtitle,
-                Priority = cachedReq.Priority,
+                Tag = cachedReq.Tag,
                 VoxHandle = handle
             });
         }

@@ -5,12 +5,29 @@
 using BeauRoutine;
 using BeauUtil;
 using BeauUtil.Debugger;
+using FieldDay.Debugging;
+using FieldDay.Files;
+using System.IO;
 using UnityEngine;
 
 namespace FieldDay.Audio {
     public sealed partial class AudioMgr {
         private void FlushCommandPipe() {
+#if DEVELOPMENT
+            bool shouldTrace = false;
+            if (DebugFlags.IsFlagSet(DebuggingFlags.TraceExecution)) {
+                shouldTrace = true;
+                if (m_CommandPipe.GetBuffer().Count > 0) {
+                    Log.Trace("[AudioMgr] Processing {0} commands...", m_CommandPipe.GetBuffer().Count);
+                }
+            }
+#endif // DEVELOPMENT
             while(m_CommandPipe.TryRead(out AudioCommand cmd)) {
+#if DEVELOPMENT
+                if (shouldTrace) {
+                    Log.Trace("[AudioMgr] Command '{0}'", cmd.Type.ToString());
+                }
+#endif // DEVELOPMENT
                 switch (cmd.Type) {
                     case AudioCommandType.StopAll: {
                         Cmd_StopAll();
@@ -87,6 +104,16 @@ namespace FieldDay.Audio {
                         break;
                     }
 
+                    case AudioCommandType.SetLoop: {
+                        Cmd_SetLoop(cmd.SetLoop);
+                        break;
+                    }
+
+                    case AudioCommandType.SetUnloadFlag: {
+                        Cmd_SetUnloadFlag(cmd.SetUnloadFlag);
+                        break;
+                    }
+
                     default: {
                         Log.Error("[AudioMgr] Unknown audio command type '{0}'", cmd.Type);
                         break;
@@ -108,7 +135,7 @@ namespace FieldDay.Audio {
         private unsafe void Cmd_StopWithHandle(UniqueId16 handle, float delay, Curve curve) {
             VoiceData voice = FindVoiceForId(handle, out int idx);
             if (idx >= 0) {
-                if (delay <= 0) {
+                if (delay <= 0 || voice.State == VoiceState.PlayRequested) {
                     KillVoice(voice);
                     m_ActiveVoices.FastRemoveAt(idx);
                 } else {
@@ -142,7 +169,7 @@ namespace FieldDay.Audio {
             for (int i = m_ActiveVoices.Count - 1; i >= 0; i--) {
                 VoiceData voice = m_ActiveVoices[i];
                 if (voice.Tag == tag) {
-                    if (delay <= 0) {
+                    if (delay <= 0 || voice.State == VoiceState.PlayRequested) {
                         KillVoice(voice);
                         m_ActiveVoices.FastRemoveAt(i);
                     } else {
@@ -252,6 +279,30 @@ namespace FieldDay.Audio {
             }
         }
 
+        private unsafe void Cmd_SetLoop(SetInstanceBoolCommandData loopData) {
+            VoiceData voice = FindVoiceForId(loopData.Handle);
+            if (voice != null) {
+                voice.Components.Source.loop = loopData.Value;
+            }
+        }
+
+        private unsafe void Cmd_SetUnloadFlag(SetInstanceBoolCommandData flagData) {
+            VoiceData voice = FindVoiceForId(flagData.Handle);
+            if (voice != null) {
+                if (flagData.Value) {
+                    voice.Flags |= AudioPlaybackFlags.EagerUnload;
+                    if (voice.StreamingEntry != null) {
+                        voice.Flags |= AudioPlaybackFlags.EagerUnload;
+                    }
+                } else {
+                    voice.Flags &= ~AudioPlaybackFlags.EagerUnload;
+                    if (voice.StreamingEntry != null) {
+                        voice.Flags &= ~AudioPlaybackFlags.EagerUnload;
+                    }
+                }
+            }
+        }
+
         #endregion // Params
 
         #region Playback
@@ -269,22 +320,21 @@ namespace FieldDay.Audio {
         private void Cmd_PlayFromAsset(PlayCommandData cmd) {
             var asset = Find.FromId(cmd.Asset.InstanceId);
             AudioClip clip = asset as AudioClip;
-            AudioEvent evt = asset as AudioEvent;
 
-            if (clip == null && evt == null) {
-                Log.Error("[AudioMgr] No clips or AudioEvents found with instance id '{0}'", cmd.Asset.InstanceId);
+            if (clip == null) {
+                Log.Error("[AudioMgr] No clips found with instance id '{0}'", cmd.Asset.InstanceId);
                 FreeHandle(ref cmd.Handle);
                 return;
             }
 
-            PlayClipInternal(cmd, evt, clip);
+            PlayClipInternal(cmd, null, clip);
         }
 
         private void Cmd_PlayExisting(UniqueId16 id) {
             VoiceData voice = FindVoiceForId(id);
             if (voice != null && voice.KillTweenIndex < 0) {
                 if (voice.State == VoiceState.Idle) {
-                    voice.State = VoiceState.Playing;
+                    voice.State = VoiceState.PlayRequested;
                 }
             }
         }
@@ -295,6 +345,7 @@ namespace FieldDay.Audio {
             float pan = cmd.Pan;
 
             AudioPropertyBlock evtProperties = AudioPropertyBlock.Default;
+            StreamedClip streamedClip = null;
 
             if (clip == null && (cmd.Flags & AudioPlaybackFlags.SecondaryClipOverride) != 0) {
                 clip = Find.FromId(cmd.SecondaryAsset.InstanceId) as AudioClip;
@@ -302,13 +353,18 @@ namespace FieldDay.Audio {
             
             if (evt != null) {
                 if (clip == null) {
-                    if (evt.SampleSelector == null) {
-                        evt.SampleSelector = new RandomDeck<AudioClip>(evt.Samples);
+                    if (evt.CachedStreamedClipKey != 0) {
+                        streamedClip = GetStreamedClip(evt.CachedStreamedClipKey);
+                        clip = streamedClip.Clip;
+                    } else {
+                        if (evt.SampleSelector == null) {
+                            evt.SampleSelector = new RandomDeck<AudioClip>(evt.Samples);
+                        }
+                        clip = evt.SampleSelector.Next();
                     }
-                    clip = evt.SampleSelector.Next();
                 }
 
-                evtProperties.Volume = evt.Volume.Generate();
+                evtProperties.Volume = evt.Volume.Generate() * evt.VolumeMultiplier;
                 evtProperties.Pitch = evt.Pitch.Generate();
                 evtProperties.Pan = evt.Pan.Generate();
 
@@ -327,6 +383,10 @@ namespace FieldDay.Audio {
                     }
                 }
 
+                if (evt.UnloadAfterPlayback) {
+                    cmd.Flags |= AudioPlaybackFlags.EagerUnload;
+                }
+
                 if (cmd.Tag.IsEmpty) {
                     cmd.Tag = evt.Tag;
                 }
@@ -334,7 +394,7 @@ namespace FieldDay.Audio {
                 priority = evt.Priority;
             }
 
-            if (clip == null) {
+            if (clip == null && (streamedClip == null || (streamedClip.Flags & StreamedClipFlags.Error) != 0)) {
                 Log.Error("[AudioMgr] Failed to resolve clip");
                 FreeHandle(ref cmd.Handle);
                 return;
@@ -371,21 +431,23 @@ namespace FieldDay.Audio {
             } else {
                 voiceComponents = m_VoiceComponentPool.Alloc();
                 src = voiceComponents.Source;
-
-#if UNITY_EDITOR
-                voiceComponents.gameObject.name = clip.name;
-#endif // UNITY_EDITOR
             }
 
             src.clip = clip;
             src.priority = priority;
             src.loop = (cmd.Flags & AudioPlaybackFlags.Loop) != 0;
 
-            if (clip.loadState == AudioDataLoadState.Unloaded) {
-                if (delay > 0) {
-                    m_PreloadQueue.PushBack(clip);
-                } else {
-                    m_PreloadQueue.PushFront(clip);
+            if (streamedClip != null) {
+                if ((streamedClip.Flags & StreamedClipFlags.LoadingStateMask) == 0) {
+                    LoadStreamed(streamedClip, delay > 0 ? FileLoadPriority.High : FileLoadPriority.Urgent);
+                }
+            } else {
+                if (clip.loadState == AudioDataLoadState.Unloaded) {
+                    if (delay > 0) {
+                        m_PreloadQueue.PushBack(clip);
+                    } else {
+                        m_PreloadQueue.PushFront(clip);
+                    }
                 }
             }
 
@@ -410,8 +472,27 @@ namespace FieldDay.Audio {
             voice.BusIndex = evt ? evt.CachedBusIndex : 0;
 
 #if DEVELOPMENT
-            voice.DebugName = clip.name;
+            if (clip != null) {
+                voice.DebugName = clip.name;
+            } else {
+                voice.DebugName = Path.GetFileNameWithoutExtension(streamedClip.Path);
+            }
 #endif // DEVELOPMENT
+
+            voice.StreamingEntry = streamedClip;
+            if (streamedClip != null) {
+                streamedClip.RefCount++;
+                Assert.True(streamedClip.RefCount != 0, "Too many references to streamed clip");
+                if ((cmd.Flags & AudioPlaybackFlags.EagerUnload) != 0) {
+                    streamedClip.Flags |= StreamedClipFlags.EagerUnload;
+                }
+            }
+
+#if UNITY_EDITOR
+            if ((cmd.Flags & AudioPlaybackFlags.UseProvidedSource) == 0) {
+                voiceComponents.gameObject.name = voice.DebugName;
+            }
+#endif // UNITY_EDITOR
 
             if ((cmd.Flags & AudioPlaybackFlags.UseProvidedSource) == 0 && emitterConfig.Mode != AudioEmitterMode.Fixed) {
                 if (playbackPos) {

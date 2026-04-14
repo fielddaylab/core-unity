@@ -16,8 +16,11 @@ using BeauPools;
 using BeauUtil;
 using BeauUtil.Debugger;
 using FieldDay.Debugging;
+using FieldDay.Perf;
+using FieldDay.Collections;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Profiling;
 
 namespace FieldDay.Memory {
 
@@ -35,6 +38,8 @@ namespace FieldDay.Memory {
         private IPool<Mesh> m_MeshPool;
         private IPool<Material> m_MaterialPool;
         private Shader m_DefaultShader;
+
+        private DoubleBuffered<StringArena> m_StringSliceFrameAllocator;
 
         private Transform m_PersistentPoolRoot;
 
@@ -96,7 +101,61 @@ namespace FieldDay.Memory {
             }
         }
 
+        /// <summary>
+        /// How many ticks since the last garbage collection event.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long TicksSinceLastGC() {
+            return Stopwatch.GetTimestamp() - m_MostRecentGCTimestamp;
+        }
+
+        /// <summary>
+        /// How many seconds since the last garbage collection event.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public float SecondsSinceLastGC() {
+            return (float) ((Stopwatch.GetTimestamp() - m_MostRecentGCTimestamp) / (double) Stopwatch.Frequency);
+        }
+
         #endregion // GC
+
+        #region Strings
+
+        internal void SwapAllocationBuffers() {
+            m_StringSliceFrameAllocator.Next().Reset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public StringSlice AllocString(string source) {
+            return m_StringSliceFrameAllocator.Current.Alloc(source);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public StringSlice AllocString(StringSlice source) {
+            return m_StringSliceFrameAllocator.Current.Alloc(source);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public StringSlice AllocString(StringBuilderSlice source) {
+            return m_StringSliceFrameAllocator.Current.Alloc(source);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public StringSlice AllocString(UnsafeString source) {
+            return m_StringSliceFrameAllocator.Current.Alloc(source);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public unsafe StringSlice AllocString(char* source, int sourceLength) {
+            return m_StringSliceFrameAllocator.Current.Alloc(source, sourceLength);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public StringSlice AllocString(UnsafeSpan<char> source) {
+            return m_StringSliceFrameAllocator.Current.Alloc(source);
+        }
+
+        #endregion // Strings
 
         #region Arenas
 
@@ -156,6 +215,9 @@ namespace FieldDay.Memory {
             m_GCCollectTimestamps = new long[genCount];
             m_LastKnownGenerationCount = genCount;
 
+            m_StringSliceFrameAllocator.Current = new StringArena(configuration.DoubleBufferedStringCapacityKB * Unsafe.KiB / 2);
+            m_StringSliceFrameAllocator.Back = new StringArena(configuration.DoubleBufferedStringCapacityKB * Unsafe.KiB / 2);
+
             m_MeshPool = new DynamicPool<Mesh>(configuration.MeshCapacity, (p) => new Mesh(), false);
             m_MeshPool.Config.RegisterOnDestruct((p, m) => GameObject.DestroyImmediate(m));
 
@@ -171,6 +233,8 @@ namespace FieldDay.Memory {
             m_ArenaTracker = new RingBuffer<Unsafe.ArenaHandle>(64, RingBufferMode.Expand);
 #endif // MEMORY_LEAK_DETECTION
 
+            PooledObjectWorkList.Initialize();
+
             GameObject prefabPoolGO = new GameObject("Prefab Pools");
             GameObject.DontDestroyOnLoad(prefabPoolGO);
             prefabPoolGO.SetActive(false);
@@ -178,20 +242,38 @@ namespace FieldDay.Memory {
         }
 
         internal void Update() {
+#if DEVELOPMENT
             if (DebugFlags.IsFlagSet(DebuggingFlags.DisplayBasicStats)) {
                 long gcMem = GC.GetTotalMemory(false);
                 ulong textureMem = Texture.currentTextureMemory;
 
+                long monoHeapUsed = Profiler.GetMonoUsedSizeLong();
+                long monoHeapSize = Profiler.GetMonoHeapSizeLong();
+                long totalAllocatedMemory = PerfUtility.GetTotalAllocatedMemory();
+
                 using (PooledStringBuilder psb = PooledStringBuilder.Create()) {
                     psb.Builder.Append("Managed Memory: ");
                     Unsafe.FormatBytes(gcMem, psb);
+                    psb.Builder.Append("\nMono Heap: ");
+                    Unsafe.FormatBytes(monoHeapUsed, psb);
+                    psb.Builder.Append(" / ");
+                    Unsafe.FormatBytes(monoHeapSize, psb);
                     psb.Builder.Append("\nTexture Memory: ");
                     Unsafe.FormatBytes((long)textureMem, psb);
+                    psb.Builder.Append("\nSeconds Since Last GC: ").AppendNoAlloc(SecondsSinceLastGC(), 2);
+#if UNITY_WEBGL && !UNITY_EDITOR
+                    psb.Builder.Append("\nWASM Heap: ");
+#else
+                    psb.Builder.Append("\nSystem Memory Size: ");
+#endif // UNITY_WEBGL && !UNITY_EDITOR
+                    Unsafe.FormatBytes(totalAllocatedMemory, psb);
+                    psb.Builder.Append(" / ").AppendNoAlloc(SystemInfo.systemMemorySize).Append("MiB");
 
                     DebugDraw.AddLogText(psb, Color.yellow);
                 }
             }
-        }
+#endif // DEVELOPMENT
+                }
 
         internal void Shutdown() {
             m_MeshPool.Dispose();
@@ -208,6 +290,7 @@ namespace FieldDay.Memory {
             }
 #endif // MEMORY_LEAK_DETECTION
 
+            PooledObjectWorkList.Shutdown();
             Mem.Mgr = null;
         }
 
@@ -270,12 +353,13 @@ namespace FieldDay.Memory {
 #endif // DEVELOPMENT
 
 #endregion // Debugging
-        }
+    }
 
     [Serializable]
     public struct MemoryPoolConfiguration {
         public int MeshCapacity;
         public int MaterialCapacity;
         public int UnmanagedBudgetMB;
+        public int DoubleBufferedStringCapacityKB;
     }
 }

@@ -27,9 +27,16 @@ namespace FieldDay.Scripting {
         private VoxRequestHandle m_Voiceover;
         private float m_VoiceoverReleaseTime;
 
+        private IDialoguePrinter m_CurrentPrinter;
+        private IDialogueChoicePresenter m_CurrentChoicePresenter;
+        private readonly RingBuffer<IScriptThreadOwned> m_OwnedResources;
+
+        private DialogueCharacterState m_LastKnownCharacter;
+
         public ScriptThread(IPool<ScriptThread> pool, ScriptPlugin inPlugin) : base(inPlugin) {
             m_Pool = pool;
             m_CustomPlugin = inPlugin;
+            m_OwnedResources = new RingBuffer<IScriptThreadOwned>(8, RingBufferMode.Expand);
         }
 
         #region Initial State
@@ -107,12 +114,15 @@ namespace FieldDay.Scripting {
         internal void StartSkipping() {
             m_Flags |= ScriptThreadFlags.SkipSingle;
             m_Routine.SetTimeScale(1000);
+            m_CurrentPrinter?.StartSkip();
         }
 
         internal void StopSkipping() {
             if ((m_Flags & ScriptThreadFlags.Skipping) != 0) {
                 m_Flags &= ~(ScriptThreadFlags.Skipping | ScriptThreadFlags.SkipSingle);
                 m_Routine.SetTimeScale(1);
+
+                m_CurrentPrinter?.CancelSkip();
 
                 m_CustomPlugin.StopSkippingCutscene(GetHandle());
             }
@@ -155,6 +165,13 @@ namespace FieldDay.Scripting {
                 m_Voiceover = default;
                 m_VoiceoverReleaseTime = 0;
             }
+        }
+
+        /// <summary>
+        /// Returns if the current voiceover line is playing.
+        /// </summary>
+        public bool IsVoxPlaying() {
+            return m_Voiceover.IsValid && VoxUtility.IsPlaying(m_Voiceover);
         }
 
         /// <summary>
@@ -209,12 +226,174 @@ namespace FieldDay.Scripting {
 
         #endregion // Voiceover
 
+        #region Choice
+
+        public void BeginChoice() {
+            m_Flags |= ScriptThreadFlags.Choosing;
+        }
+
+        public void EndChoice() {
+            m_Flags &= ~ScriptThreadFlags.Choosing;
+        }
+
+        #endregion // Choice
+
+        #region Character State
+
+        public DialogueCharacterState GetCharacterState() {
+            return m_LastKnownCharacter;
+        }
+
+        public void SetCharacterState(DialogueCharacterState characterState) {
+            if (!m_LastKnownCharacter.Equals(characterState)) {
+                m_LastKnownCharacter = characterState;
+                m_CurrentPrinter?.UpdateCharacter(characterState);
+            }
+        }
+
+        #endregion // Character State
+
+        #region Resources
+
+        /// <summary>
+        /// Returns the current dialogue print interface.
+        /// </summary>
+        public IDialoguePrinter GetPrinter() {
+            return m_CurrentPrinter;
+        }
+
+        /// <summary>
+        /// Sets the current dialogue print interface.
+        /// </summary>
+        public void SetPrinter(IDialoguePrinter printer) {
+            if (printer != m_CurrentPrinter) {
+                if (m_CurrentPrinter != null && m_CurrentPrinter != m_CurrentChoicePresenter) {
+                    m_CurrentPrinter.TryClearThreadOwner(GetHandle(), ScriptThreadOwnershipClearReason.Cancelled);
+                }
+                m_CurrentPrinter = printer;
+                if (m_CurrentPrinter != null && m_CurrentPrinter != m_CurrentChoicePresenter) {
+                    m_CurrentPrinter.SwitchThreadOwner(GetHandle());
+                }
+            }
+        }
+
+        /// <summary>
+        /// Releases the current printer.
+        /// </summary>
+        public void ReleaseCurrentPrinter(ScriptThreadOwnershipClearReason reason) {
+            if (m_CurrentPrinter != null) {
+                if (m_CurrentPrinter != m_CurrentChoicePresenter) {
+                    m_CurrentPrinter.TryClearThreadOwner(GetHandle(), reason);
+                }
+                m_CurrentPrinter = null;
+            }
+        }
+
+        /// <summary>
+        /// Returns the current dialogue choice interface.
+        /// </summary
+        public IDialogueChoicePresenter GetChoicePresenter() {
+            return m_CurrentChoicePresenter;
+        }
+
+        /// <summary>
+        /// Sets the current dialogue choice interface.
+        /// </summary>
+        public void SetChoicePresenter(IDialogueChoicePresenter choicePresenter) {
+            if (choicePresenter != m_CurrentChoicePresenter) {
+                if (m_CurrentChoicePresenter != null && m_CurrentChoicePresenter != m_CurrentPrinter) {
+                    m_CurrentChoicePresenter.TryClearThreadOwner(GetHandle(), ScriptThreadOwnershipClearReason.Cancelled);
+                }
+                m_CurrentChoicePresenter = choicePresenter;
+                if (m_CurrentChoicePresenter != null && m_CurrentChoicePresenter != m_CurrentPrinter) {
+                    m_CurrentChoicePresenter.SwitchThreadOwner(GetHandle());
+                }
+            }
+        }
+
+        /// <summary>
+        /// Releases the current choice interface.
+        /// </summary>
+        public void ReleaseCurrentChoicePresenter(ScriptThreadOwnershipClearReason reason) {
+            if (m_CurrentChoicePresenter != null) {
+                if (m_CurrentChoicePresenter != m_CurrentPrinter) {
+                    m_CurrentChoicePresenter.TryClearThreadOwner(GetHandle(), reason);
+                }
+                m_CurrentChoicePresenter = null;
+            }
+        }
+
+        /// <summary>
+        /// Acquires ownership of a resource.
+        /// </summary>
+        public void TakeOwnership(IScriptThreadOwned owned) {
+            Assert.NotNull(owned);
+
+            IDialoguePrinter printer = owned as IDialoguePrinter;
+            IDialogueChoicePresenter choicePresenter = owned as IDialogueChoicePresenter;
+
+            if (printer != null) {
+                SetPrinter(printer);
+            }
+            if (choicePresenter != null) {
+                SetChoicePresenter(choicePresenter);
+            }
+
+            if (printer == null && choicePresenter == null) {
+                owned.SwitchThreadOwner(GetHandle());
+                m_OwnedResources.PushBack(owned);
+            }
+        }
+
+        /// <summary>
+        /// Releases ownership of a resource.
+        /// </summary>
+        public void ReleaseOwnership(IScriptThreadOwned owned, ScriptThreadOwnershipClearReason reason) {
+            Assert.NotNull(owned);
+
+            IDialoguePrinter printer = owned as IDialoguePrinter;
+            IDialogueChoicePresenter choicePresenter = owned as IDialogueChoicePresenter;
+
+            if (choicePresenter != null && m_CurrentChoicePresenter == choicePresenter) {
+                ReleaseCurrentChoicePresenter(reason);
+            }
+            if (printer != null && m_CurrentPrinter == printer) {
+                ReleaseCurrentPrinter(reason);
+            }
+
+            if (printer == null && choicePresenter == null) {
+                owned.TryClearThreadOwner(GetHandle(), reason);
+                m_OwnedResources.FastRemove(owned);
+            }
+        }
+
+        #endregion // Resources
+
         protected override void Reset() {
+            ScriptThreadOwnershipClearReason releaseReason = !HasNodes() ? ScriptThreadOwnershipClearReason.Completed : ScriptThreadOwnershipClearReason.Cancelled;
+
             m_CustomPlugin.StopTracking(this);
-            VoxUtility.Stop(ref m_Voiceover);
+            if (m_Voiceover.IsValid) {
+                VoxUtility.Stop(ref m_Voiceover);
+            }
             m_VoiceoverReleaseTime = 0;
+            m_LastKnownCharacter = default;
 
             StopSkipping();
+
+            LeafThreadHandle handle = GetHandle();
+
+            while(m_OwnedResources.TryPopBack(out var owned)) {
+                owned.TryClearThreadOwner(handle, releaseReason);
+            }
+
+            m_CurrentChoicePresenter?.TryClearThreadOwner(handle, releaseReason);
+            m_CurrentPrinter?.TryClearThreadOwner(handle, releaseReason);
+
+            m_CurrentPrinter = null;
+            m_CurrentChoicePresenter = null;
+
+            Log.Msg("[ScriptThread] Thread '{0}' killed", m_OriginalNodeId.ToDebugString());
 
             base.Reset();
 
@@ -238,6 +417,7 @@ namespace FieldDay.Scripting {
         Cutscene = 0x02,
         IsFunction = 0x04,
         IsTrigger = 0x08,
-        SkipSingle = 0x10
+        SkipSingle = 0x10,
+        Choosing = 0x20
     }
 }

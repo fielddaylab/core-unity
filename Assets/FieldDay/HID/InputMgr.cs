@@ -4,9 +4,11 @@
 
 using System;
 using System.Diagnostics;
+using BeauPools;
 using BeauUtil;
 using BeauUtil.Debugger;
 using FieldDay.Debugging;
+using FieldDay.UI;
 using NativeUtils;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -29,6 +31,63 @@ namespace FieldDay.HID {
             }
         }
 
+        private sealed class NullInputStream : BaseInput {
+            protected override void Awake() {
+                base.Awake();
+                hideFlags = HideFlags.HideAndDontSave;
+            }
+
+            public override string compositionString {
+                get { return string.Empty; }
+            }
+
+            public override int touchCount {
+                get { return 0; }
+            }
+
+            public override Vector2 mousePosition {
+                get { return new Vector2(-1024, -1024); }
+            }
+
+            public override Touch GetTouch(int index) {
+                return default;
+            }
+
+            public override bool GetMouseButton(int button) {
+                return false;
+            }
+
+            public override bool GetMouseButtonDown(int button) {
+                return false;
+            }
+
+            public override bool GetMouseButtonUp(int button) {
+                return false;
+            }
+
+            public override bool GetButtonDown(string buttonName) {
+                return false;
+            }
+
+            public override float GetAxisRaw(string axisName) {
+                return 0;
+            }
+
+            public override IMECompositionMode imeCompositionMode {
+                get { return IMECompositionMode.Off; }
+                set { }
+            }
+
+            public override Vector2 compositionCursorPos {
+                get { return default; }
+                set { }
+            }
+
+            public override Vector2 mouseScrollDelta {
+                get { return default; }
+            }
+        }
+
         #endregion // Types
 
         #region State
@@ -36,17 +95,22 @@ namespace FieldDay.HID {
         private EventSystem m_EventSystem;
         private BaseInputModule m_DefaultInputModule;
         private ExposedPointerInputModule m_ExposedInputModule;
+        private NullInputStream m_NullInputStream;
+
         private uint m_ForceClickRecurseCounter;
         private RingBuffer<InputTimestamp> m_ClickTimestampBuffer = new RingBuffer<InputTimestamp>(2, RingBufferMode.Overwrite);
         private uint m_EventPauseCounter;
         private uint m_DevicePauseCounter;
         private bool m_InputConsumed;
 
+        private PointerInputMode m_InputMode;
+        private Vector2 m_LastKnownMousePosition;
+
 #if DEVELOPMENT
         private bool m_DebugEventPauseOverride;
 #endif // DEVELOPMENT
 
-#endregion // State
+        #endregion // State
 
         internal InputMgr() { }
 
@@ -73,7 +137,11 @@ namespace FieldDay.HID {
             Assert.NotNull(m_ExposedInputModule);
 
             m_ForceClickRecurseCounter++;
-            bool success = ExecuteEvents.Execute(root, m_ExposedInputModule.GetPointerEventData(), ExecuteEvents.pointerClickHandler);
+            PointerEventData evtData = m_ExposedInputModule.GetPointerEventData();
+            GameObject prevPointerClick = evtData.pointerClick;
+            evtData.pointerClick = root;
+            bool success = ExecuteEvents.Execute(root, evtData, ExecuteEvents.pointerClickHandler);
+            evtData.pointerClick = prevPointerClick;
             m_ForceClickRecurseCounter--;
             return success;
         }
@@ -94,7 +162,7 @@ namespace FieldDay.HID {
             }
 
             long timeSince = m_ClickTimestampBuffer[0].Ticks - m_ClickTimestampBuffer[1].Ticks;
-            long bufferTicks = (long) (buffer * Stopwatch.Frequency);
+            long bufferTicks = (long)(buffer * Stopwatch.Frequency);
             return m_ClickTimestampBuffer[0].FrameIndex == Frame.Index && timeSince <= bufferTicks;
         }
 
@@ -115,7 +183,7 @@ namespace FieldDay.HID {
         /// Returns if a mouse button is down this frame.
         /// </summary>
         public bool IsMouseDown(MouseButton mouseButton) {
-            return m_DevicePauseCounter == 0 && !m_InputConsumed && Input.GetMouseButton((int) mouseButton);
+            return m_DevicePauseCounter == 0 && !m_InputConsumed && Input.GetMouseButton((int)mouseButton);
         }
 
         /// <summary>
@@ -129,7 +197,7 @@ namespace FieldDay.HID {
         /// Returns if a mouse button was pressed this frame.
         /// </summary>
         public bool IsMousePressed(MouseButton mouseButton) {
-            return m_DevicePauseCounter == 0 && !m_InputConsumed && Input.GetMouseButtonDown((int) mouseButton);
+            return m_DevicePauseCounter == 0 && !m_InputConsumed && Input.GetMouseButtonDown((int)mouseButton);
         }
 
         /// <summary>
@@ -176,12 +244,19 @@ namespace FieldDay.HID {
         /// were pressed this frame.
         /// </summary>
         public bool IsKeyComboPressed(ModifierKeyCode modifier, KeyCode keyCode) {
-            return m_DevicePauseCounter == 0 && !m_InputConsumed && keyCode > 0 && Input.GetKeyDown(keyCode) && (modifier == 0 || Input.GetKey((KeyCode) modifier));
+            return m_DevicePauseCounter == 0 && !m_InputConsumed && keyCode > 0 && Input.GetKeyDown(keyCode) && (modifier == 0 || Input.GetKey((KeyCode)modifier));
         }
 
         #endregion // Keys
 
         #region Raycasts
+
+        /// <summary>
+        /// Returns if a mouse cursor is present or a touch is active.
+        /// </summary>
+        public bool HasPointer() {
+            return m_InputMode == PointerInputMode.Mouse || Input.touchCount > 0;
+        }
 
         /// <summary>
         /// Returns the object the pointer is currently over.
@@ -231,10 +306,17 @@ namespace FieldDay.HID {
 
             if (!m_ExposedInputModule) {
                 Log.Warn("[InputMgr] Could not find ExposedInputInputModule");
+                m_ExposedInputModule = null;
+                m_InputMode = !Input.mousePresent || Input.touchSupported ? PointerInputMode.Touch : PointerInputMode.Mouse;
+            } else {
+                m_InputMode = m_ExposedInputModule.Mode;
+                m_ExposedInputModule.OnModeChanged += OnInputModeChanged;
             }
             if (!m_DefaultInputModule) {
                 Log.Warn("[InputMgr] Could not find any input module");
                 m_DefaultInputModule = null;
+            } else {
+                m_NullInputStream = m_ExposedInputModule.gameObject.AddComponent<NullInputStream>();
             }
 
             GameLoop.OnGuiEvent.Register(OnGui);
@@ -246,6 +328,22 @@ namespace FieldDay.HID {
         internal void BeginFrame() {
             if (Input.GetMouseButtonDown(0)) {
                 m_ClickTimestampBuffer.PushFront(InputTimestamp.Now());
+            }
+
+            if (ReferenceEquals(m_ExposedInputModule, null)) {
+                Vector2 newMousePos = Input.mousePosition;
+                
+                if (m_InputMode == PointerInputMode.Mouse) {
+                    if (Input.touchCount > 0 || !Input.mousePresent) {
+                        OnInputModeChanged(PointerInputMode.Touch);
+                    }
+                } else {
+                    if (newMousePos != m_LastKnownMousePosition || Input.GetMouseButton(0) || Input.GetMouseButton(1) || Input.GetMouseButton(2)) {
+                        OnInputModeChanged(PointerInputMode.Mouse);
+                    }
+                }
+
+                m_LastKnownMousePosition = newMousePos;
             }
 
             m_InputConsumed = false;
@@ -269,6 +367,12 @@ namespace FieldDay.HID {
             }
         }
 
+        internal void EndFrame() {
+#if DEVELOPMENT
+            DebugUpdate();
+#endif // DEVELOPMENT
+        }
+
         internal void Shutdown() {
             NativeInput.SetEventSystem(null);
             NativeInput.Shutdown();
@@ -277,6 +381,11 @@ namespace FieldDay.HID {
 
             m_EventSystem = null;
             m_ExposedInputModule = null;
+        }
+
+        private void OnInputModeChanged(PointerInputMode mode) {
+            m_InputMode = mode;
+            Log.Msg("[InputMgr] Input mode changed to '{0}'", mode);
         }
 
         #endregion // Events
@@ -301,7 +410,9 @@ namespace FieldDay.HID {
                 }
 #endif // DEVELOPMENT
                 m_EventSystem.SetSelectedGameObject(null);
-                m_DefaultInputModule?.DeactivateModule();
+                if (m_DefaultInputModule) {
+                    m_DefaultInputModule.inputOverride = m_NullInputStream;
+                }
                 NativeInput.SetEventSystemEnabled(false);
             }
         }
@@ -310,8 +421,11 @@ namespace FieldDay.HID {
         /// Resumes all raycasting.
         /// </summary>
         public void ResumeRaycasts() {
-            if (m_EventPauseCounter > 0 && m_EventPauseCounter-- == 1) {
-                m_DefaultInputModule?.ActivateModule();
+            Assert.True(m_EventPauseCounter > 0, "Unbalanced Pause Resume Raycasts.");
+            if (m_EventPauseCounter-- == 1) {
+                if (m_DefaultInputModule) {
+                    m_DefaultInputModule.inputOverride = null;
+                }
                 NativeInput.SetEventSystemEnabled(true);
             }
         }
@@ -322,12 +436,16 @@ namespace FieldDay.HID {
                 m_DebugEventPauseOverride = debugPaused;
 
                 if (debugPaused) {
-                    m_DefaultInputModule?.ActivateModule();
+                    if (m_DefaultInputModule) {
+                        m_DefaultInputModule.inputOverride = null;
+                    }
                     NativeInput.SetEventSystemEnabled(true);
                 } else {
                     if (m_EventPauseCounter > 0) {
                         m_EventSystem.SetSelectedGameObject(null);
-                        m_DefaultInputModule?.DeactivateModule();
+                        if (m_DefaultInputModule) {
+                            m_DefaultInputModule.inputOverride = m_NullInputStream;
+                        }
                         NativeInput.SetEventSystemEnabled(false);
                     }
                 }
@@ -355,9 +473,26 @@ namespace FieldDay.HID {
         /// Resumes all devices.
         /// </summary>
         public void ResumeDevices() {
-            if (m_DevicePauseCounter > 0 && m_DevicePauseCounter-- == 1) {
+            Assert.True(m_DevicePauseCounter > 0, "Unbalanced Pause Resume Devices.");
+            if (m_DevicePauseCounter-- == 1) {
                 // TODO: resume devices
             }
+        }
+
+        /// <summary>
+        /// Pauses all raycasts and devices.
+        /// </summary>
+        public void PauseAll() {
+            PauseRaycasts();
+            PauseDevices();
+        }
+
+        /// <summary>
+        /// Resumes all raycasts and devices.
+        /// </summary>
+        public void ResumeAll() {
+            ResumeDevices();
+            ResumeRaycasts();
         }
 
         #endregion // Pausing
@@ -373,24 +508,57 @@ namespace FieldDay.HID {
         }
 
         #endregion // Consume
+
+        #region Debug
+
+#if DEVELOPMENT
+
+        private enum DebuggingFlags {
+            DisplayCurrentPointerInfo,
+        }
+
+        [EngineMenuFactory]
+        static private DMInfo CreateDebugMenu() {
+            DMInfo input = new DMInfo("Input");
+            DebugFlags.Menu.AddFlagToggle(input, "Display Pointer Info", DebuggingFlags.DisplayCurrentPointerInfo);
+            input.AddSelector("Hinted Cursor Visiblity",
+                () => (int)HintedCursor.Visibility,
+                (i) => HintedCursor.Visibility = (HintedCursor.VisiblityMode)i,
+                new string[] { "Invisible", "Interactive Only", "Always" });
+            return input;
+        }
+
+        private void DebugUpdate() {
+            if (DebugFlags.IsFlagSet(DebuggingFlags.DisplayCurrentPointerInfo)) {
+                using(PooledStringBuilder psb = PooledStringBuilder.CreateLarge()) {
+                    
+                }
+            }
+        }
+
+#endif // DEVELOPMENT
+
+        #endregion // Debug
     }
 
     public enum ModifierKeyCode {
+        None = 0,
+
         LeftControl = KeyCode.LeftControl,
         LCtrl = KeyCode.LeftControl,
         RightControl = KeyCode.RightControl,
         RCtrl = KeyCode.RightControl,
-        
+
         LeftShift = KeyCode.LeftShift,
         LShfit = KeyCode.LeftShift,
         RightShift = KeyCode.RightShift,
         RShift = KeyCode.RightShift,
-        
+
         LeftAlt = KeyCode.LeftAlt,
         LAlt = KeyCode.LeftAlt,
         RightAlt = KeyCode.RightAlt,
         RAlt = KeyCode.RightAlt,
-        
+
         LeftMeta = KeyCode.LeftMeta,
         LMeta = KeyCode.LeftMeta,
         RightMeta = KeyCode.RightMeta,

@@ -13,6 +13,7 @@ namespace FieldDay.Assets {
     /// Property attribute marking a string/StringHash32/SerializedHash32 field as an asset identifier.
     /// This will store the name of the asset.
     /// </summary>
+    [Conditional("UNITY_EDITOR")]
     public class AssetNameAttribute : PropertyAttribute {
         public readonly Type AssetType;
         internal readonly bool UseDropdown;
@@ -40,7 +41,7 @@ namespace FieldDay.Assets {
             return currentHash ^ ((nextVal != null ? nextVal.GetHashCode() : 0) + (currentHash >> 2) + (currentHash << 5));
         }
 
-#if DEVELOPMENT
+#if UNITY_EDITOR
         internal uint GetCacheKey() {
             if (m_CachedCacheKey == 0) {
                 unsafe {
@@ -52,7 +53,7 @@ namespace FieldDay.Assets {
         }
 
         private uint m_CachedCacheKey;
-#endif // DEVELOPMENT
+#endif // UNITY_EDITOR 
 
         public AssetNameAttribute(Type assetType, bool useDropdown = false) {
             if (assetType == null) {
@@ -61,13 +62,13 @@ namespace FieldDay.Assets {
             AssetType = assetType;
             order = -10;
 
-#if DEVELOPMENT
+#if UNITY_EDITOR
             UseDropdown = useDropdown;
             if (!UseDropdown) {
                 UseDropdown = GetType().GetMethod("Predicate", BindingFlags.NonPublic | BindingFlags.Instance).DeclaringType != typeof(AssetNameAttribute);
                 UseDropdown |= GetType().GetMethod("Name", BindingFlags.NonPublic | BindingFlags.Instance).DeclaringType != typeof(AssetNameAttribute);
             }
-#endif // DEVELOPMENT
+#endif // UNITY_EDITOR
         }
     }
 }

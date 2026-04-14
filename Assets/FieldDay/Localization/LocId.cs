@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Text;
 using BeauUtil;
 using UnityEngine;
 
@@ -26,8 +27,12 @@ namespace FieldDay.Localization {
             m_HashValue = new StringHash32(source).HashValue;
         }
 
-        public uint HashValue {
+        public readonly uint HashValue {
             get { return m_HashValue; }
+        }
+
+        public readonly bool IsEmpty {
+            get { return m_HashValue == 0; }
         }
 
         #region Interfaces
@@ -42,6 +47,10 @@ namespace FieldDay.Localization {
 
         public string ToDebugString() {
             return new StringHash32(m_HashValue).ToDebugString();
+        }
+
+        public void ToDebugString(StringBuilder sb) {
+            new StringHash32(m_HashValue).ToDebugString(sb);
         }
 
         #endregion // Interfaces
@@ -78,23 +87,28 @@ namespace FieldDay.Localization {
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        static public implicit operator LocId(StringHash32 inHash) {
-            return new LocId(inHash);
+        static public implicit operator LocId(StringHash32 source) {
+            return new LocId(source);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        static public implicit operator LocId(StringSlice inSlice) {
-            return new LocId(inSlice);
+        static public implicit operator StringHash32(LocId id) {
+            return new StringHash32(id.HashValue);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        static public implicit operator LocId(string inString) {
-            return new StringHash32(inString);
+        static public implicit operator LocId(StringSlice source) {
+            return new LocId(source);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        static public explicit operator bool(LocId inHash) {
-            return inHash.m_HashValue != 0;
+        static public implicit operator LocId(string source) {
+            return new StringHash32(source);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static public explicit operator bool(LocId id) {
+            return id.m_HashValue != 0;
         }
 
         #endregion // Operators

@@ -4,6 +4,7 @@
 
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Reflection;
 using BeauRoutine;
 using BeauUtil;
@@ -15,6 +16,7 @@ using FieldDay.Data;
 using FieldDay.HID;
 using FieldDay.HID.XR;
 using FieldDay.Perf;
+using FieldDay.Rendering;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.Scripting;
@@ -151,6 +153,25 @@ namespace FieldDay.Debugging {
                     DebugDraw.EnableRendering();
                 }
                 DebugInput.ConsumeAllForFrame();
+            }
+
+            if (DebugInput.IsPressed(InputModifierKeys.Shift, KeyCode.Return)) {
+                DebugInput.ConsumeAllForFrame();
+
+                Camera cam = Game.Rendering.PrimaryCamera;
+                if (!cam) {
+                    Log.Error("[DebugConsole] No primary camera to render");
+                } else {
+                    if (Game.IsEditor) {
+                        Texture2D screenshot = CameraUtility.RenderToScreenshot(cam, CameraScreenshotFlags.OverrideRenderScaleComponent, RenderMgr.ScreenshotScale);
+                        byte[] bytes = screenshot.EncodeToPNG();
+                        Directory.CreateDirectory("Screenshots");
+                        string fileName = string.Format("{0} {1}.png", DateTime.Now.ToString("dd-MM-yyyy-HHmmss"), SceneHelper.ActiveScene().Name);
+                        File.WriteAllBytes("Screenshots/" + fileName, bytes);
+                        Log.Msg("[DebugConsole] Wrote screenshot '{0}' to Screenshots folder", fileName);
+                        DestroyImmediate(screenshot);
+                    }
+                }
             }
 
             if (m_MinimalVisible) {
@@ -358,9 +379,9 @@ namespace FieldDay.Debugging {
             if (DebugInput.IsPressed(DebugInputButtons.Cancel)) {
                 return DMMenuUI.NavigationCommand.Back;
             } else if (DebugInput.IsPressed(DebugInputButtons.DPadLeft)) {
-                return DMMenuUI.NavigationCommand.PrevPage;
+                return DebugInput.IsDown(DebugInputButtons.Modifier) ? DMMenuUI.NavigationCommand.DecreaseSlider : DMMenuUI.NavigationCommand.PrevPage;
             } else if (DebugInput.IsPressed(DebugInputButtons.DPadRight)) {
-                return DMMenuUI.NavigationCommand.NextPage;
+                return DebugInput.IsDown(DebugInputButtons.Modifier) ? DMMenuUI.NavigationCommand.IncreaseSlider : DMMenuUI.NavigationCommand.NextPage;
             } else if (DebugInput.IsPressed(DebugInputButtons.DPadUp)) {
                 return DMMenuUI.NavigationCommand.MoveArrowUp;
             } else if (DebugInput.IsPressed(DebugInputButtons.DPadDown)) {
@@ -422,6 +443,8 @@ namespace FieldDay.Debugging {
                     DMInfo.MergeSubmenu(engineMenu, menu, true);
                 }
             }
+
+            DebugDraw.AddRenderToggle(engineMenu, "Debug Drawing");
 
             DMInfo.SortByLabel(engineMenu);
 
@@ -535,6 +558,8 @@ namespace FieldDay.Debugging {
             } else {
                 FramerateDisplay.Show();
             }
+
+            DebugFlags.SetDebugConsoleVisible(visible);
 
             if (!visible) {
                 SetMenuVisible(false);

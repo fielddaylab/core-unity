@@ -4,21 +4,25 @@
 
 using System;
 using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using BeauRoutine;
 using BeauUtil;
+using BeauUtil.Debugger;
+using BeauUtil.Variants;
+using EasyAssetStreaming;
 using UnityEngine;
 using UnityEngine.SceneManagement;
-using BeauUtil.Debugger;
-using BeauRoutine;
 using FieldDay.Rendering;
 using FieldDay.Assets;
-using System.Runtime.CompilerServices;
-using EasyAssetStreaming;
 using FieldDay.Debugging;
 using FieldDay.Threading;
 
 #if UNITY_EDITOR
-using UnityEditor.SceneManagement;
 using UnityEditor;
+using UnityEditor.SceneManagement;
 #endif // UNITY_EDITOR
 
 namespace FieldDay.Scenes {
@@ -142,6 +146,17 @@ namespace FieldDay.Scenes {
             }
         }
 
+        private struct QueuedRequestContext {
+            public StringHash32 PathHash;
+            public SceneRequestContext Data;
+        }
+
+        private struct TaggedRequestContext {
+            public StringHash32 Tag;
+            public bool WasUsed;
+            public SceneRequestContext Data;
+        }
+
         #endregion // Types
 
         #region State
@@ -153,6 +168,10 @@ namespace FieldDay.Scenes {
         private SceneDataExt m_MainScene;
         private readonly RingBuffer<SceneDataExt> m_AuxScenes = new RingBuffer<SceneDataExt>(16, RingBufferMode.Expand);
         private readonly RingBuffer<SceneDataExt> m_PersistentScenes = new RingBuffer<SceneDataExt>(16, RingBufferMode.Expand);
+        private readonly RingBuffer<int> m_MainSceneIndexHistory = new RingBuffer<int>(4, RingBufferMode.Overwrite);
+        private readonly HashSet<int> m_TrackedScenes = new HashSet<int>(16, CompareUtils.DefaultEquals<int>());
+        private readonly RingBuffer<QueuedRequestContext> m_QueuedContexts = new RingBuffer<QueuedRequestContext>(4, RingBufferMode.Expand);
+        private readonly RingBuffer<TaggedRequestContext> m_TaggedContexts = new RingBuffer<TaggedRequestContext>(4, RingBufferMode.Fixed);
 
         // queues
         private readonly RingBuffer<LoadProcessArgs> m_LoadProcessQueue = new RingBuffer<LoadProcessArgs>();
@@ -178,6 +197,7 @@ namespace FieldDay.Scenes {
         private Routine m_AdditionalSceneLoadProcess;
         private Routine m_MainSceneTransition;
         private int m_AssetUnloadLock;
+        private bool m_InitialSceneWasRedirected = true;
 
         // handlers
         private SceneTransitionHandler m_MainTransitionUnload;
@@ -196,16 +216,20 @@ namespace FieldDay.Scenes {
 
         #region Exposed Events
 
-        public readonly CastableEvent<SceneEventArgs> OnPrepareScene = new CastableEvent<SceneEventArgs>();
-        public readonly CastableEvent<SceneEventArgs> OnScenePreload = new CastableEvent<SceneEventArgs>();
-        public readonly CastableEvent<SceneEventArgs> OnSceneReady = new CastableEvent<SceneEventArgs>();
+        public readonly CastableEvent<SceneCallbackArgs> OnPrepareScene = new CastableEvent<SceneCallbackArgs>();
+        public readonly CastableEvent<SceneCallbackArgs> OnScenePreload = new CastableEvent<SceneCallbackArgs>();
+        public readonly CastableEvent<SceneCallbackArgs> OnSceneReady = new CastableEvent<SceneCallbackArgs>();
         public readonly ActionEvent OnMainSceneLateEnable = new ActionEvent();
         public readonly ActionEvent OnMainSceneReady = new ActionEvent();
         public readonly ActionEvent OnMainSceneUnloading = new ActionEvent();
         public readonly ActionEvent OnMainSceneUnloaded = new ActionEvent();
-        public readonly CastableEvent<SceneEventArgs> OnSceneUnload = new CastableEvent<SceneEventArgs>();
+        public readonly CastableEvent<SceneCallbackArgs> OnSceneUnload = new CastableEvent<SceneCallbackArgs>();
         public readonly ActionEvent OnAnySceneUnloaded = new ActionEvent();
         public readonly ActionEvent OnAnySceneEnabled = new ActionEvent();
+
+#if DEVELOPMENT
+        private readonly ActionEvent m_OnDebugSceneLoad = new ActionEvent();
+#endif // DEVELOPMENT
 
         #endregion // Exposed Events
 
@@ -215,7 +239,11 @@ namespace FieldDay.Scenes {
 
             SceneHelper.IgnoreSceneByName("*_PERSISTENT");
             SceneHelper.IgnoreSceneByName("*_LAYER");
+            SceneHelper.IgnoreSceneByName("*_AUX");
+            SceneHelper.IgnoreSceneByName("*_LAYOUT");
+            SceneHelper.IgnoreSceneByName("*_ASSETS");
             SceneHelper.IgnoreSceneByName("Boot");
+            SceneHelper.IgnoreSceneByName("_ResourceDump");
         }
 
         #region Public API
@@ -266,6 +294,13 @@ namespace FieldDay.Scenes {
         }
 
         /// <summary>
+        /// Returns if any auxillary scene is currently loading.
+        /// </summary>
+        public bool IsAuxLoading() {
+            return m_AdditionalSceneLoadProcess || IsLoadQueued(SceneType.Aux);
+        }
+
+        /// <summary>
         /// Returns if the given scene is loading.
         /// </summary>
         public bool IsLoading(SceneReference scene) {
@@ -283,6 +318,12 @@ namespace FieldDay.Scenes {
 
             for (int i = 0; i < m_LoadProcessQueue.Count; i++) {
                 if (m_LoadProcessQueue[i].Path == scenePath) {
+                    return true;
+                }
+            }
+
+            for(int i = 0; i < m_LoadQueue.Count; i++) {
+                if (m_LoadQueue[i].ScenePath == scenePath) {
                     return true;
                 }
             }
@@ -356,10 +397,20 @@ namespace FieldDay.Scenes {
             return m_UnloadQueue.Count > 0 || m_CurrentUnloadOperation.Active || IsLoadQueued(SceneType.Main);
         }
 
-        internal bool IsSafeToUnloadAssets() {
+        /// <summary>
+        /// Returns if it is safe to unload any assets.
+        /// </summary>
+        public bool IsSafeToUnloadAssets() {
             return m_AssetUnloadLock == 0 && !IsLoadQueued(SceneType.Main) && m_LoadQueue.Count == 0 && !m_CurrentLoadOperation.Active
                 && m_PreloadQueue.Count == 0 && !m_CurrentPreloadOperation.Active
                 && m_UnloadQueue.Count == 0 && !m_CurrentUnloadOperation.Active;
+        }
+
+        /// <summary>
+        /// Returns the previous main scene index.
+        /// </summary>
+        public int GetPreviousMainSceneIndex() {
+            return m_MainSceneIndexHistory.Count > 1 ? m_MainSceneIndexHistory[m_MainSceneIndexHistory.Count - 2] : -1;
         }
 
         #endregion // Checks
@@ -422,6 +473,10 @@ namespace FieldDay.Scenes {
         #region Aux Load
 
         public void LoadAuxScene(string scenePath, StringHash32 tag, Matrix4x4? transformBy = null, SceneImportFlags flags = 0) {
+            QueueSceneLoadInternal(scenePath, tag, SceneType.Aux, flags, transformBy, SceneLoadPriority.Default);
+        }
+
+        public void LoadAuxScene(string scenePath, StringHash32 tag, SceneRequestContext context, Matrix4x4? transformBy = null, SceneImportFlags flags = 0) {
             QueueSceneLoadInternal(scenePath, tag, SceneType.Aux, flags, transformBy, SceneLoadPriority.Default);
         }
 
@@ -722,19 +777,128 @@ namespace FieldDay.Scenes {
 
         #endregion // Callbacks
 
+        #region Contexts
+
+        /// <summary>
+        /// Sets request context data for the given scene load.
+        /// </summary>
+        public void QueueLoadContext(string path, in SceneRequestContext context) {
+            Assert.True(!string.IsNullOrEmpty(path), "Cannot submit an invalid scene path");
+            QueueLoadContextWithPathHash(StringHash32.Fast(path), context);
+        }
+
+        /// <summary>
+        /// Sets request context data for the given scene load.
+        /// </summary>
+        public void QueueLoadContext(SceneReference sceneReference, in SceneRequestContext context) {
+            Assert.True(sceneReference.IsValid, "Cannot submit an invalid scene path");
+            QueueLoadContextWithPathHash(StringHash32.Fast(sceneReference.Path), context);
+        }
+
+        /// <summary>
+        /// Sets request context data for the given scene load.
+        /// </summary>
+        public void QueueMainLoadContext(in SceneRequestContext context) {
+            QueueLoadContextWithPathHash(null, context);
+        }
+
+        private void QueueLoadContextWithPathHash(StringHash32 pathHash, in SceneRequestContext context) {
+            for (int i = 0; i < m_QueuedContexts.Count; i++) {
+                ref QueuedRequestContext test = ref m_QueuedContexts[i];
+                if (test.PathHash == pathHash) {
+                    test.Data = context;
+                    return;
+                }
+            }
+
+            m_QueuedContexts.PushBack(new QueuedRequestContext() {
+                PathHash = pathHash,
+                Data = context
+            });
+        }
+
+        /// <summary>
+        /// Sets request context data for all scene loads with the given tag.
+        /// </summary>
+        public void SetTaggedLoadContext(StringHash32 tag, in SceneRequestContext context) {
+            Assert.True(!tag.IsEmpty, "Cannot set tagged request context for an empty tag");
+
+            for(int i = 0; i < m_TaggedContexts.Count; i++) {
+                ref TaggedRequestContext test = ref m_TaggedContexts[i];
+                if (test.Tag == tag) {
+                    test.Data = context;
+                    test.WasUsed = false;
+                    return;
+                }
+            }
+
+            Assert.True(!m_TaggedContexts.IsFull(), "Cannot have more than {0} tagged contexts at once", m_TaggedContexts.Capacity);
+            m_TaggedContexts.PushBack(new TaggedRequestContext() {
+                Tag = tag,
+                Data = context
+            });
+        }
+
+        /// <summary>
+        /// Returns the main scene load context.
+        /// </summary>
+        public bool GetLoadContext(out SceneRequestContext context) {
+            if (m_MainScene) {
+                context = m_MainScene.Context;
+                return true;
+            }
+
+            context = default;
+            return false;
+        }
+
+        /// <summary>
+        /// Returns the load context for the given scene.
+        /// </summary>
+        public bool GetLoadContext(Scene scene, out SceneRequestContext context) {
+            SceneDataExt data = SceneDataExt.Get(scene);
+            if (data) {
+                context = data.Context;
+                return true;
+            }
+
+            context = default;
+            return false;
+        }
+
+        /// <summary>
+        /// Returns the load context for the given scene.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool GetLoadContext(GameObject gameObject, out SceneRequestContext context) {
+            return GetLoadContext(gameObject.scene, out context);
+        }
+
+        /// <summary>
+        /// Returns the load context for the given scene.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool GetLoadContext(Component component, out SceneRequestContext context) {
+            return GetLoadContext(component.gameObject.scene, out context);
+        }
+
+        #endregion // Contexts
+
         #endregion // Public API
 
         #region Events
 
         internal void Prepare() {
-            if (m_MainScene == null && !m_MainSceneLoadProcess) {
-                QueueMainLoadInternal(SceneManager.GetActiveScene().path, false, true, default);
+            if (m_MainScene == null && !m_MainSceneLoadProcess && !IsLoadQueued(SceneType.Main)) {
+                m_InitialSceneWasRedirected = false;
+                QueueMainLoadInternal(SceneManager.GetActiveScene().path, false, true, default, true);
             }
 
             // need to ensure we still have a scene remaining when unloading,
             // even if it's just an empty dummy scene
             Scene dummyScene = SceneManager.CreateScene("__DummyScene");
             m_DummyScene = dummyScene;
+            TrackScene(dummyScene);
         }
 
         internal void Update() {
@@ -753,6 +917,26 @@ namespace FieldDay.Scenes {
             for (int i = m_PersistentScenes.Count - 1; i >= 0; i--) {
                 if (!m_PersistentScenes[i]) {
                     m_PersistentScenes.FastRemoveAt(i);
+                }
+            }
+
+            if (m_AssetUnloadLock == 0 && m_LoadProcessQueue.Count == 0 && m_LoadQueue.Count == 0 && m_SubSceneQueue.Count == 0) {
+                if (m_QueuedContexts.Count > 0) {
+#if DEVELOPMENT
+                    for (int i = m_QueuedContexts.Count; i-- > 0;) {
+                        Log.Warn("[SceneMgr] Context for scene '{0}' was unused, discarding", m_QueuedContexts[i].PathHash.ToDebugString());
+                    }
+#else
+                    Log.Warn("[SceneMgr] Contexts for {0} scenes were unused, discarding", m_QueuedContexts.Count);
+#endif // DEVELOPMENT
+                    m_QueuedContexts.Clear();
+                }
+
+                if (m_TaggedContexts.Count > 0) {
+#if DEVELOPMENT
+                    Log.Msg("[SceneMgr] Clearing {0} tagged request contexts", m_TaggedContexts.Count);
+#endif // DEVELOPMENT
+                    m_TaggedContexts.Clear();
                 }
             }
         }
@@ -813,18 +997,47 @@ namespace FieldDay.Scenes {
             m_MainSceneLoadProcess.Stop();
             m_AdditionalSceneLoadProcess.Stop();
 
+            OnPrepareScene.Clear();
             OnScenePreload.Clear();
             OnSceneReady.Clear();
-            OnSceneUnload.Clear();
-            OnAnySceneEnabled.Clear();
-            OnAnySceneUnloaded.Clear();
+            OnMainSceneLateEnable.Clear();
             OnMainSceneReady.Clear();
-            OnPrepareScene.Clear();
+            OnMainSceneUnloading.Clear();
+            OnMainSceneUnloaded.Clear();
+            OnSceneUnload.Clear();
+            OnAnySceneUnloaded.Clear();
+            OnAnySceneEnabled.Clear();
+
+#if DEVELOPMENT
+            m_OnDebugSceneLoad.Clear();
+#endif // DEVELOPMENT
         }
 
-        #endregion // Events
+#endregion // Events
 
         #region Internal
+
+        private bool IsSceneTracked(Scene scene) {
+            return scene.buildIndex < 0 || m_TrackedScenes.Contains(scene.handle);
+        }
+
+        private void TrackScene(Scene scene) {
+            //Log.Msg("[SceneMgr] Tracking scene {0}...", scene.name);
+            bool inserted = m_TrackedScenes.Add(scene.handle);
+            Assert.True(inserted, "Tracked scene '{0}' tracked multiple times", scene.name);
+        }
+
+        private void TryTrackScene(Scene scene) {
+            if (m_TrackedScenes.Add(scene.handle)) {
+                //Log.Msg("[SceneMgr] Tracking scene {0}...", scene.name);
+            }
+        }
+
+        private void UntrackScene(Scene scene) {
+            //Log.Msg("[SceneMgr] Untracking scene {0}...", scene.name);
+            bool removed = m_TrackedScenes.Remove(scene.handle);
+            Assert.True(removed, "Tracked scene '{0}' removed multiple times", scene.name);
+        }
 
         static private bool IsLoadingOrLoaded(Scene scene) {
             SceneHelper.LoadingState loadingState = scene.GetLoadingState();
@@ -832,7 +1045,7 @@ namespace FieldDay.Scenes {
         }
 
         static private bool IsDoneLoading(AsyncOperation operation, in LoadSceneArgs args, out Scene scene) {
-            if (Scenes.Editor.AreDelayedSceneProcessorsRunning()) {
+            if (SceneUtils.Editor.AreDelayedSceneProcessorsRunning()) {
                 scene = default;
                 return false;
             }
@@ -851,7 +1064,7 @@ namespace FieldDay.Scenes {
             }
         }
 
-        private void QueueMainLoadInternal(string path, bool killNonPersistentLoads, bool forceReload, in MainSceneTransitionArgs transition) {
+        private void QueueMainLoadInternal(string path, bool killNonPersistentLoads, bool forceReload, in MainSceneTransitionArgs transition, bool isDefaultScene = false) {
             SceneDataExt data = SceneDataExt.GetByPath(path);
 
             if (!forceReload && data != null && data.IsVisited(SceneDataExt.VisitFlags.Loaded)) {
@@ -872,7 +1085,7 @@ namespace FieldDay.Scenes {
             }
             m_LoadProcessQueue.PushFront(args);
 
-            if (!killNonPersistentLoads) {
+            if (!isDefaultScene) {
                 DebugFlags.MarkNewSceneLoaded();
             }
         }
@@ -957,9 +1170,10 @@ namespace FieldDay.Scenes {
 
         private bool ProcessLoadQueue() {
             if (m_CurrentLoadOperation.Active) {
-                LoadSceneArgs args = m_CurrentLoadOperation.Args;
+                ref LoadSceneArgs args = ref m_CurrentLoadOperation.Args;
                 if (IsDoneLoading(m_CurrentLoadOperation.UnityOp, args, out Scene scene)) {
-                    Log.Msg("[SceneMgr] Additive load of '{0}' complete", args.ScenePath);
+                    Log.Msg("[SceneMgr] Additive load of '{0}' (build index {1}) complete", args.ScenePath, scene.buildIndex);
+                    TrackScene(scene);
                     EnqueueSceneProcessors(scene, args);
                     m_CurrentLoadOperation.Clear();
                     return true;
@@ -967,17 +1181,15 @@ namespace FieldDay.Scenes {
                     return false;
                 }
             } else if (m_CurrentLoadOperation.TryFill(m_LoadQueue)) {
-                LoadSceneArgs args = m_CurrentLoadOperation.Args;
+                ref LoadSceneArgs args = ref m_CurrentLoadOperation.Args;
                 Scene currentScene = SafeGetSceneByPath(args.ScenePath);
                 if (!IsLoadingOrLoaded(currentScene)) {
                     Log.Msg("[SceneMgr] Starting additive load of '{0}'", args.ScenePath);
-#if UNITY_EDITOR
-                    m_CurrentLoadOperation.UnityOp = EditorSceneManager.LoadSceneAsyncInPlayMode(args.ScenePath, new LoadSceneParameters(LoadSceneMode.Additive));
-#else
+                    // NOTE: EditorSceneManager.LoadSceneAsyncInPlayMode will mess up buildIndex, that's why we aren't using it
                     m_CurrentLoadOperation.UnityOp = SceneManager.LoadSceneAsync(args.ScenePath, LoadSceneMode.Additive);
-#endif // UNITY_EDITOR
                 } else if (currentScene.isLoaded) {
                     Log.Msg("[SceneMgr] Scene '{0}' already loaded", args.ScenePath);
+                    TryTrackScene(currentScene);
                     EnqueueSceneProcessors(currentScene, args);
                     m_CurrentLoadOperation.Clear();
                 }
@@ -1000,6 +1212,8 @@ namespace FieldDay.Scenes {
             data.SceneTag = args.Tag;
             data.SceneType = args.Type;
 
+            CheckForQueuedRequestContext(data.SceneBinding.Id, args.Tag, args.Type, out data.Context);
+            
             if (args.Parent != null && args.Type != SceneType.Persistent && (args.Flags & SceneImportFlags.AttachAsChild) != 0) {
                 args.Parent.Children.PushBack(data);
             }
@@ -1010,6 +1224,7 @@ namespace FieldDay.Scenes {
                 case SceneType.Main: {
                         m_MainScene = data;
                         SceneManager.SetActiveScene(scene);
+                        m_MainSceneIndexHistory.PushBack(scene.buildIndex);
                         break;
                     }
 
@@ -1069,11 +1284,36 @@ namespace FieldDay.Scenes {
             args.Counter.Decrement();
 
             if (!OnPrepareScene.IsEmpty) {
-                OnPrepareScene.Invoke(new SceneEventArgs() {
+                OnPrepareScene.Invoke(new SceneCallbackArgs() {
                     LoadType = args.Type,
                     Scene = scene
                 });
             }
+        }
+
+        private bool CheckForQueuedRequestContext(StringHash32 pathHash, StringHash32 tag, SceneType type, out SceneRequestContext context) {
+            for (int i = m_QueuedContexts.Count; i-- > 0;) {
+                ref QueuedRequestContext test = ref m_QueuedContexts[i];
+                if ((type == SceneType.Main && test.PathHash.IsEmpty) || test.PathHash == pathHash) {
+                    context = test.Data;
+                    m_QueuedContexts.FastRemoveAt(i);
+                    return true;
+                }
+            }
+
+            if (!tag.IsEmpty) {
+                for (int i = m_TaggedContexts.Count; i-- > 0;) {
+                    ref TaggedRequestContext test = ref m_TaggedContexts[i];
+                    if (test.Tag == tag) {
+                        test.WasUsed = true;
+                        context = test.Data;
+                        return true;
+                    }
+                }
+            }
+
+            context = default;
+            return false;
         }
 
         private bool ProcessUnloadQueue() {
@@ -1096,7 +1336,15 @@ namespace FieldDay.Scenes {
             } else if (m_UnloadQueue.TryPopFront(out UnloadSceneArgs args)) {
                 if (args.Data) {
                     // if the scene hasn't finished loading, then push this off until later
-                    if (!args.Data.IsVisited(SceneDataExt.VisitFlags.Readied)) {
+                    if (!args.Data.IsVisited(SceneDataExt.VisitFlags.Loaded)) {
+                        m_CurrentUnloadOperation.Fill(args);
+                        //UntrackScene(args.Data.Scene);
+                        Log.Msg("[SceneMgr] Unloading '{0}'", args.Data.Scene.path);
+                        m_CurrentUnloadOperation.UnityOp = SceneManager.UnloadSceneAsync(args.Data.Scene, args.Options);
+                        return true;
+                    }
+                    // if the scene hasn't finished loading, then push this off until later
+                    else if (!args.Data.IsVisited(SceneDataExt.VisitFlags.Readied)) {
                         Log.Warn("[SceneMgr] Delaying unload of scene '{0}' until scene is finished with load process", args.Data.Scene.path);
                         m_UnloadQueue.PushBack(args);
                         return false;
@@ -1109,7 +1357,7 @@ namespace FieldDay.Scenes {
                         }
                         SceneHelper.OnUnload(scene);
                         if (!OnSceneUnload.IsEmpty) {
-                            OnSceneUnload.Invoke(new SceneEventArgs() {
+                            OnSceneUnload.Invoke(new SceneCallbackArgs() {
                                 LoadType = args.Data.SceneType,
                                 Scene = args.Data.Scene
                             });
@@ -1127,6 +1375,7 @@ namespace FieldDay.Scenes {
                                 args.Counter.Increment();
                             }
                         }
+                        UntrackScene(scene);
                         Log.Msg("[SceneMgr] Unloading '{0}'", args.Data.Scene.path);
                         m_CurrentUnloadOperation.UnityOp = SceneManager.UnloadSceneAsync(scene, args.Options);
                     } else { // otherwise, it's already done and we can move on
@@ -1246,6 +1495,9 @@ namespace FieldDay.Scenes {
                         foreach (var obj in args.Data.LateEnable) {
                             obj.SetActive(true);
                         }
+                        foreach (ISceneLateInitialize obj in args.Data.LateInitialize) {
+                            obj.LateInitialize();
+                        }
                         foreach (ISceneCustomData custom in args.Data.CustomData) {
                             custom.OnLateEnable();
                         }
@@ -1269,6 +1521,22 @@ namespace FieldDay.Scenes {
             }
         }
 
+        private void UnloadUntrackedScenes(CounterHandle counter) {
+            // unload all untracked scenes
+            int sceneCount = SceneManager.sceneCount;
+            while (sceneCount-- > 0) {
+                var potentialScene = SceneManager.GetSceneAt(sceneCount);
+                if (!IsSceneTracked(potentialScene)) {
+                    m_UnloadQueue.PushBack(new UnloadSceneArgs() {
+                        Data = SceneDataExt.Get(potentialScene),
+                        Options = UnloadSceneOptions.None,
+                        Counter = counter
+                    });
+                    counter.Increment();
+                }
+            }
+        }
+
         #endregion // Operations
 
         #region Routines
@@ -1282,6 +1550,9 @@ namespace FieldDay.Scenes {
         }
 
         private IEnumerator SceneLoadProcess(LoadProcessArgs args) {
+            bool isRedirect = m_InitialSceneWasRedirected;
+            m_InitialSceneWasRedirected = false;
+
             using (CounterHandle counter = CounterHandle.Alloc()) {
 
                 // validate
@@ -1290,7 +1561,7 @@ namespace FieldDay.Scenes {
                     yield break;
                 }
 
-                while (Scenes.Editor.AreDelayedSceneProcessorsRunning()) {
+                while (SceneUtils.Editor.AreDelayedSceneProcessorsRunning()) {
                     yield return null;
                 }
 
@@ -1301,7 +1572,7 @@ namespace FieldDay.Scenes {
                 if (args.Type == SceneType.Main) {
                     m_MainSceneTransition.Stop();
 
-                    Game.Events.Dispatch(Scenes.Events.PreUnload);
+                    Game.Events.Dispatch(SceneUtils.Events.PreUnload);
                     OnMainSceneUnloading.Invoke();
 
                     if (m_MainTransitionUnload != null) {
@@ -1332,6 +1603,10 @@ namespace FieldDay.Scenes {
                             Counter = counter
                         });
                         counter.Increment();
+                    }
+
+                    if (isRedirect) {
+                        UnloadUntrackedScenes(counter);
                     }
 
                     while (!counter.IsDone()) {
@@ -1372,7 +1647,7 @@ namespace FieldDay.Scenes {
                 for (int i = 0; i < manifests.Length; i++) {
                     manifests[i] = linearizedScenes[i].Preload;
                     if (!OnScenePreload.IsEmpty) {
-                        OnScenePreload.Invoke(new SceneEventArgs() {
+                        OnScenePreload.Invoke(new SceneCallbackArgs() {
                             Scene = linearizedScenes[i].Scene,
                             LoadType = linearizedScenes[i].SceneType
                         });
@@ -1387,6 +1662,17 @@ namespace FieldDay.Scenes {
 
                 while (!counter.IsDone()) {
                     yield return null;
+                }
+
+                // child scenes
+
+                if (args.Type == SceneType.Main) {
+                    if (m_AdditionalSceneLoadProcess || m_LoadProcessQueue.Count > 0) {
+                        Log.Trace("[SceneMgr] Main load waiting for additional loads to complete...");
+                        do {
+                            yield return null;
+                        } while (m_AdditionalSceneLoadProcess || m_LoadProcessQueue.Count > 0);
+                    }
                 }
 
                 // dependencies
@@ -1404,9 +1690,10 @@ namespace FieldDay.Scenes {
                 m_AssetUnloadLock--;
                 yield return AssetUtility.UnloadUnused();
 
-                Log.Trace("[SceneMgr] Unloading unused streaming assets...");
+                Log.Trace("[SceneMgr] Unloading unused streaming assets (pass 1)...");
 
-                Streaming.UnloadUnusedAsync();
+                Streaming.UnloadUnusedAsync(30);
+                Game.Rendering.TetrahedralizeLightProbes();
 
                 if (args.Type == SceneType.Main) {
 
@@ -1418,6 +1705,10 @@ namespace FieldDay.Scenes {
                     while (Streaming.IsUnloading()) {
                         yield return null;
                     }
+
+                    while(Game.Rendering.AreLightProbesDirty()) {
+                        yield return null;
+                    }
                 }
 
                 // late enable
@@ -1427,7 +1718,7 @@ namespace FieldDay.Scenes {
                 Log.Trace("[SceneMgr] Processing LateEnable...");
 
                 foreach (var data in linearizedScenes) {
-                    if (data.LateEnable.Length > 0 && !data.IsVisited(SceneDataExt.VisitFlags.LateEnabled)) {
+                    if ((data.LateEnable.Length > 0 || data.LateInitialize.Length > 0) && !data.IsVisited(SceneDataExt.VisitFlags.LateEnabled)) {
                         m_LateEnableQueue.PushBack(new LateEnableArgs() {
                             Data = data,
                             Counter = counter
@@ -1451,10 +1742,14 @@ namespace FieldDay.Scenes {
 
                 if (args.Type == SceneType.Main) {
                     OnMainSceneLateEnable.Invoke();
-                    Game.Events.Dispatch(Scenes.Events.Ready);
+                    Game.Events.Dispatch(SceneUtils.Events.LateEnable);
                 }
 
                 // one more check for dependencies
+
+                Log.Trace("[SceneMgr] Unloading unused streaming assets (pass 2)...");
+
+                Streaming.UnloadUnusedAsync();
 
                 Log.Trace("[SceneMgr] Waiting for remaining dependencies...");
 
@@ -1464,11 +1759,11 @@ namespace FieldDay.Scenes {
 
                 // broadcast ready
 
-                Log.Msg("[SceneMgr] Scene is ready");
+                Log.Msg("[SceneMgr] Scene '{0}' is ready", args.Path);
 
                 foreach (var data in linearizedScenes) {
                     data.TryVisit(SceneDataExt.VisitFlags.Readied);
-                    OnSceneReady.Invoke(new SceneEventArgs() {
+                    OnSceneReady.Invoke(new SceneCallbackArgs() {
                         Scene = data.Scene,
                         LoadType = data.SceneType
                     });
@@ -1488,7 +1783,7 @@ namespace FieldDay.Scenes {
                     }
                 }
 
-                Game.Events.Dispatch(Scenes.Events.Ready);
+                Game.Events.Dispatch(SceneUtils.Events.Ready);
             }
         }
 
@@ -1497,6 +1792,10 @@ namespace FieldDay.Scenes {
         #region Dependencies
 
         private bool AreDependenciesAndStreamingLoaded(SceneLoadPhase phase) {
+            if (BuildInfo.IsLoading()) {
+                return false;
+            }
+
             for (int i = 0; i < m_Dependencies.Count; i++) {
                 if (!m_Dependencies[i].IsLoaded(phase)) {
                     return false;
@@ -1525,6 +1824,10 @@ namespace FieldDay.Scenes {
         /// Returns if all load dependencies loaded.
         /// </summary>
         public bool AreLoadDependenciesLoaded(SceneLoadPhase phase = SceneLoadPhase.Any) {
+            if (BuildInfo.IsLoading()) {
+                return false;
+            }
+
             for (int i = 0; i < m_Dependencies.Count; i++) {
                 if (!m_Dependencies[i].IsLoaded(phase)) {
                     return false;
@@ -1582,6 +1885,15 @@ namespace FieldDay.Scenes {
 
         #endregion // Dependencies
 
+        #region SceneManager API Override
+
+        // TODO: implement?
+        private sealed class UnityAPIOverride : SceneManagerAPI {
+
+        }
+
+        #endregion // SceneManager API Override
+
         #region Debug
 
 #if DEVELOPMENT
@@ -1592,12 +1904,12 @@ namespace FieldDay.Scenes {
         static private DMInfo CreateDebugMenu() {
             DMInfo menu = new DMInfo("Scenes", 16);
             DMPredicate loadPredicate = () => !Game.Scenes.IsMainLoading();
-            menu.AddButton("Reload Current Scene", () => Game.Scenes.ReloadMainScene(), loadPredicate);
+            menu.AddButton("Reload Current Scene", () => { Game.Scenes.ReloadMainScene(); InvokeDebugSceneLoad(); }, loadPredicate);
             menu.AddDivider();
 
             foreach(var scene in SceneHelper.AllBuildScenes()) {
                 SceneReference cachedRef = scene;
-                menu.AddButton(scene.Name, () => Game.Scenes.LoadMainScene(cachedRef), loadPredicate);
+                menu.AddButton(scene.Name, () => { Game.Scenes.LoadMainScene(cachedRef); InvokeDebugSceneLoad(); }, loadPredicate);
             }
 
             menu.AddDivider();
@@ -1607,15 +1919,33 @@ namespace FieldDay.Scenes {
             return menu;
         }
 
+        static private void InvokeDebugSceneLoad() {
+            Game.Scenes.m_OnDebugSceneLoad.Invoke();
+        }
+
 #endif // DEVELOPMENT
+
+        [Conditional("DEVELOPMENT")]
+        static public void RegisterDebugLoadCallback(Action action) {
+#if DEVELOPMENT
+            Game.Scenes.m_OnDebugSceneLoad.Register(action);
+#endif // DEVELOPMENT
+        }
+
+        [Conditional("DEVELOPMENT")]
+        static public void DeregisterDebugLoadCallback(Action action) {
+#if DEVELOPMENT
+            Game.Scenes.m_OnDebugSceneLoad.Deregister(action);
+#endif // DEVELOPMENT
+        }
 
         #endregion // Debug
     }
 
     /// <summary>
-    /// Scene event arguments.
+    /// Scene callback arguments.
     /// </summary>
-    public struct SceneEventArgs {
+    public struct SceneCallbackArgs {
         public Scene Scene;
         public SceneType LoadType;
     }
@@ -1631,7 +1961,7 @@ namespace FieldDay.Scenes {
     /// <summary>
     /// Scene utility methods.
     /// </summary>
-    static public class Scenes {
+    static public class SceneUtils {
         static public class Events {
             static public readonly StringHash32 LateEnable = "SceneMgr::LateEnable";
             static public readonly StringHash32 Ready = "SceneMgr::Ready";
@@ -1650,6 +1980,13 @@ namespace FieldDay.Scenes {
         /// </summary>
         static public string ActiveSceneName() {
             return SceneManager.GetActiveScene().name;
+        }
+
+        /// <summary>
+        /// Returns a reference to the scene with the given name.
+        /// </summary>
+        static public SceneReference GetSceneByName(string sceneName) {
+            return SceneHelper.FindSceneByName(sceneName, SceneCategories.AllBuild);
         }
 
         /// <summary>
@@ -1739,6 +2076,77 @@ namespace FieldDay.Scenes {
     public enum SceneTransitionFlags : ushort {
         HintSkipTransition = 0x01,
         HintFastTransition = 0x02,
+    }
+
+    /// <summary>
+    /// Custom context data for a scene load.
+    /// </summary>
+    public struct SceneRequestContext {
+        private const int Capacity = 16;
+
+        [StructLayout(LayoutKind.Explicit)]
+        public struct Identifier {
+            [FieldOffset(0)] public int Index;
+            [FieldOffset(0)] public StringHash32 Name;
+
+            static public implicit operator Identifier(int index) {
+                return new Identifier() { Index = index };
+            }
+
+            static public implicit operator Identifier(StringHash32 name) {
+                return new Identifier() { Name = name };
+            }
+        }
+
+        public Identifier Task;
+        public Identifier Entrance;
+        public ushort Flags;
+
+        private byte m_CustomCount;
+        private unsafe fixed uint m_CustomKeys[Capacity];
+        private unsafe fixed ulong m_CustomValues[Capacity];
+
+        public readonly bool Contains(StringHash32 key) {
+            unsafe {
+                for (int i = 0; i < m_CustomCount; i++) {
+                    if (m_CustomKeys[i] == key.HashValue) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        public readonly Variant Get(StringHash32 key, Variant defaultValue = default) {
+            unsafe {
+                for (int i = 0; i < m_CustomCount; i++) {
+                    if (m_CustomKeys[i] == key.HashValue) {
+                        fixed(ulong* ptr = &m_CustomValues[0]) {
+                            return *(Variant*)(ptr + i);
+                        }
+                    }
+                }
+
+                return defaultValue;
+            }
+        }
+
+        public void Set(StringHash32 key, Variant value) {
+            unsafe {
+                ulong raw = *(ulong*)&value;
+                for (int i = 0; i < m_CustomCount; i++) {
+                    if (m_CustomKeys[i] == key.HashValue) {
+                        m_CustomValues[i] = raw;
+                    }
+                }
+
+                Assert.True(m_CustomCount < Capacity, "Max parameter count {0} reached", Capacity);
+                m_CustomKeys[m_CustomCount] = key.HashValue;
+                m_CustomValues[m_CustomCount] = raw;
+                m_CustomCount++;
+            }
+        }
     }
 
     public struct MainSceneTransitionArgs {

@@ -57,7 +57,10 @@ namespace FieldDay.Audio {
             public ushort FrameEnded;
             public short PositionSyncIndex;
             public short KillTweenIndex;
+            public int SampleLoopPoint;
+            public int SampleLoopLength;
             public FloatTweenIndices FloatTweens;
+            public StreamedClip StreamingEntry;
 
 #if DEVELOPMENT
             public string DebugName;
@@ -287,7 +290,21 @@ namespace FieldDay.Audio {
                         if (voice.PlaybackDelay > 0) {
                             voice.PlaybackDelay -= deltaTime;
                         }
-                        if (voice.PlaybackDelay <= 0 && IsVoiceLoaded(voice)) {
+
+                        bool voiceLoaded = IsVoiceLoaded(voice);
+                        if (!voiceLoaded && voice.StreamingEntry != null) {
+                            if ((voice.StreamingEntry.Flags & StreamedClipFlags.Error) != 0) {
+                                // voice failed to load
+                                Log.Error("[AudioMgr] Cancelling voice due to loading error");
+                                voice.State = VoiceState.Stopped;
+                                UpdatePlayingInstanceCount(voice.Handle, voice.BusIndex, false);
+                            } else if ((voice.StreamingEntry.Flags & StreamedClipFlags.Loaded) != 0) {
+                                voice.Components.Source.clip = voice.StreamingEntry.Clip;
+                                voiceLoaded = IsVoiceLoaded(voice);
+                            }
+                        }
+
+                        if (voiceLoaded && voice.PlaybackDelay <= 0) {
                             if ((voice.Flags & AudioPlaybackFlags.RandomizePlaybackStart) != 0) {
                                 voice.Components.Source.time = RNG.Instance.NextFloat(voice.Components.Source.clip.length);
                             }
@@ -314,6 +331,11 @@ namespace FieldDay.Audio {
 
                         if (voice.Components.Source.isPlaying) {
                             voice.FrameEnded = Frame.InvalidIndex;
+                            if (voice.Components.Source.loop && voice.SampleLoopLength > 0) {
+                                if (voice.Components.Source.timeSamples >= voice.SampleLoopPoint) {
+                                    voice.Components.Source.timeSamples -= voice.SampleLoopLength;
+                                }
+                            }
                         } else {
                             if (voice.Components.Source.loop) {
                                 voice.State = VoiceState.PlayRequested;
@@ -393,7 +415,8 @@ namespace FieldDay.Audio {
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static private bool IsVoiceLoaded(VoiceData voice) {
-            return voice.Components.Source.clip.loadState == AudioDataLoadState.Loaded;
+            AudioClip clip = voice.Components.Source.clip;
+            return clip != null && clip.loadState == AudioDataLoadState.Loaded;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -453,7 +476,7 @@ namespace FieldDay.Audio {
         }
 
         static private unsafe int CalculateKillPriorityScore(VoiceData voice, double currentTime) {
-            int score = (int) (voice.LastKnownProperties.Volume * 100);
+            int score = 101 - (int) (voice.LastKnownProperties.Volume * 100);
 
             switch (voice.State) {
                 case VoiceState.Playing:
@@ -492,8 +515,11 @@ namespace FieldDay.Audio {
         }
 
         private unsafe void KillVoice(VoiceData voice) {
+            AudioClip clip = null;
             if (voice.Components && voice.Components.Source) {
                 voice.Components.Source.Stop();
+                clip = voice.Components.Source.clip;
+                voice.Components.Source.clip = null;
                 UpdatePlayingInstanceCount(voice.Handle, voice.BusIndex, false);
             }
             voice.Components.PlayingHandle = default;
@@ -512,6 +538,14 @@ namespace FieldDay.Audio {
 
             m_TargetablePropertyBlocks.TryFree(ref voice.EventProperties);
             m_TargetablePropertyBlocks.TryFree(ref voice.VoiceProperties);
+
+            if (voice.StreamingEntry != null) {
+                Assert.True(voice.StreamingEntry.RefCount > 0);
+                voice.StreamingEntry.RefCount--;
+                voice.StreamingEntry = null;
+            } else if (clip != null && (voice.Flags & AudioPlaybackFlags.EagerUnload) != 0) {
+                clip.UnloadAudioData();
+            }
 
             voice.Components = null;
             voice.Handle = default;
@@ -573,5 +607,17 @@ namespace FieldDay.Audio {
         }
 
         #endregion // Voice Component Pool
+
+        #region Helpers
+
+        /// <summary>
+        /// Returns if a clip can be seeked precisely.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static private bool CanSeekPrecisely(AudioClip clip) {
+            return clip.loadType != AudioClipLoadType.CompressedInMemory;
+        }
+
+        #endregion // Helpers
     }
 }

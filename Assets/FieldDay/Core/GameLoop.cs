@@ -46,6 +46,7 @@ using FieldDay.Systems;
 using FieldDay.Threading;
 using FieldDay.Localization;
 using FieldDay.Files;
+using Unity.IL2CPP.CompilerServices;
 
 #if USE_SRP
 #endif // USE_SRP
@@ -55,7 +56,18 @@ namespace FieldDay {
     /// Game loop manager.
     /// </summary>
     [DefaultExecutionOrder(-23000), DisallowMultipleComponent]
+    [Il2CppEagerStaticClassConstruction]
     public sealed class GameLoop : MonoBehaviour, ICameraPreCullCallback, ICameraPostRenderCallback, ICameraPreRenderCallback {
+        #region Types
+
+        [Serializable]
+        private struct EngineHintPair {
+            public string Name;
+            public string Value;
+        }
+
+        #endregion // Types
+
         #region Inspector
 
         [SerializeField, Tooltip("Size of the per-frame allocation buffer, in KiB")]
@@ -76,6 +88,9 @@ namespace FieldDay {
         [SerializeField]
         private ReflectionBootData m_ReflectionData;
 
+        [SerializeField, KeyValuePair("Name", "Value")]
+        private EngineHintPair[] m_ConfigHints;
+
         [Header("Modules")]
 
         [SerializeField]
@@ -85,14 +100,29 @@ namespace FieldDay {
         private MemoryPoolConfiguration m_MemoryConfig = new MemoryPoolConfiguration() {
             MaterialCapacity = 16,
             MeshCapacity = 16,
-            UnmanagedBudgetMB = 2
+            UnmanagedBudgetMB = 2,
+            DoubleBufferedStringCapacityKB = 64
         };
 
         [SerializeField]
         private GuiMgr.Config m_GuiConfig = new GuiMgr.Config();
 
         [SerializeField]
-        private FileSystem.Config m_FileSystemConfig = new FileSystem.Config();
+        private FileSystem.Config m_FileSystemConfig = new FileSystem.Config() {
+            RetryDelay = 1,
+            MaxInFlightRequests = 4,
+            MaxRetryCount = 8
+        };
+
+        [SerializeField]
+        private RenderMgr.Config m_RenderConfig = new RenderMgr.Config() {
+            DebugClearColor = ColorBank.Magenta
+        };
+
+        [SerializeField]
+        private ShadingMgr.Config m_ShadingConfig = new ShadingMgr.Config() {
+            
+        };
 
         [SerializeField]
         private AssetPack[] m_GlobalAssetPacks = Array.Empty<AssetPack>();
@@ -237,6 +267,7 @@ namespace FieldDay {
             Log.Msg("[GameLoop] Starting...");
             Log.Msg("[GameLoop] Word Size = {0} ({1})", Unsafe.PointerSize, Unsafe.IsPointerSizeCompileTimeConstant ? "compile-time" : "runtime");
             Log.Msg("[GameLoop] Stopwatch Frequency = {0}hz", System.Diagnostics.Stopwatch.Frequency);
+            Log.Msg("[GameLoop] Graphics Device Type = {0} (Shader Level {1})", SystemInfo.graphicsDeviceType, SystemInfo.graphicsShaderLevel);
 
             if (ReflectionBootData.ShouldUse()) {
                 ReflectionBootData.Mount(m_ReflectionData);
@@ -252,6 +283,12 @@ namespace FieldDay {
                 CultureInfo.CurrentUICulture = CultureInfo.InvariantCulture;
                 BuildInfo.Load();
 
+                EngineHints.Initialize();
+                for(int i = 0; i < m_ConfigHints.Length; i++) {
+                    EngineHintPair data = m_ConfigHints[i];
+                    EngineHints.SetHint(data.Name, data.Value);
+                }
+
                 CommandLineArgs.Initialize();
                 ApplyCommandLineArguments();
 
@@ -266,18 +303,18 @@ namespace FieldDay {
                 Log.Msg("[GameLoop] Creating performance manager...");
                 Game.Perf = new PerformanceMgr();
 
-                Log.Msg("[GameLoop] Creating localization manager...");
-                // TODO: create localization manager
-                Loc.ConfigureDefaultLanguage(m_DefaultLanguage);
-
                 Log.Msg("[GameLoop] Creating asset manager...");
                 Game.Assets = new AssetMgr();
+
+                Log.Msg("[GameLoop] Creating localization manager...");
+                Game.Localization = new LocMgr();
+                Game.Localization.Initialize(m_DefaultLanguage);
 
                 Log.Msg("[GameLoop] Creating systems manager...");
                 Game.Systems = new SystemsMgr();
 
                 Log.Msg("[GameLoop] Creating component manager...");
-                Game.Components = new ComponentMgr(Game.Systems);
+                Game.Components = new ComponentMgr();
 
                 Log.Msg("[GameLoop] Creating shared state manager...");
                 Game.SharedState = new SharedStateMgr();
@@ -293,7 +330,11 @@ namespace FieldDay {
 
                 Log.Msg("[GameLoop] Creating rendering manager...");
                 Game.Rendering = new RenderMgr();
-                Game.Rendering.Initialize();
+                Game.Rendering.Initialize(m_RenderConfig);
+
+                Log.Msg("[GameLoop] Creating shading manager...");
+                Game.Shading = new ShadingMgr();
+                Game.Shading.Initialize(m_ShadingConfig);
 
                 Log.Msg("[GameLoop] Creating input manager...");
                 Game.Input = new InputMgr();
@@ -353,6 +394,9 @@ namespace FieldDay {
                 SetCurrentPhase(GameLoopPhase.Booted);
 
                 foreach(var pack in m_GlobalAssetPacks) {
+#if UNITY_EDITOR
+                    AssetPack.ReadFromEditorDirectory(pack);
+#endif // UNITY_EDITOR
                     Game.Assets.LoadPackage(pack);
                 }
 
@@ -362,7 +406,6 @@ namespace FieldDay {
                 Game.Rendering.LateInitialize();
                 Game.Animation.Initialize();
                 Game.Scenes.Prepare();
-                Game.Systems.ProcessInitQueue();
                 Game.Files.Tick();
                 FlushQueue(s_OnBootQueue);
 
@@ -464,6 +507,7 @@ namespace FieldDay {
                 OnApplicationQuit();
             }
             Canvas.preWillRenderCanvases -= OnPreCanvasRender;
+            EngineHints.Shutdown();
             Frame.DestroyAllocator();
             CounterHandle.DestroyAllocator();
             CrashHandler.Deregister();
@@ -498,6 +542,10 @@ namespace FieldDay {
             Game.Input.Shutdown();
             Game.Input = null;
 
+            Log.Msg("[GameLoop] Shutting down shading manager...");
+            Game.Shading.Shutdown();
+            Game.Shading = null;
+
             Log.Msg("[GameLoop] Shutting down rendering manager...");
             Game.Rendering.Shutdown();
             Game.Rendering = null;
@@ -531,6 +579,10 @@ namespace FieldDay {
                 Game.Events.Clear();
                 Game.SetEventDispatcher(null);
             }
+
+            Log.Msg("[GameLoop] Shutting down localization manager...");
+            Game.Localization.Shutdown();
+            Game.Localization = null;
 
             Log.Msg("[GameLoop] Shutting down asset manager...");
             Game.Assets.Shutdown();
@@ -665,6 +717,8 @@ namespace FieldDay {
             }
 
             Game.Gui.ProcessUpdate();
+            Game.Gui.ProcessShortcuts();
+            Game.Gui.FlushInputLayerChanges();
 
             // flush event queue
             Game.Events.Flush();
@@ -677,6 +731,7 @@ namespace FieldDay {
             Game.Scenes.Update();
             Game.Assets.Update();
             Game.Rendering.PollScreenSettings();
+            Game.Input.EndFrame();
 
             s_ReadyForRender = true;
         }
@@ -784,13 +839,16 @@ namespace FieldDay {
                 Frame.UnscaledDeltaTime = Time.unscaledDeltaTime;
                 s_WasLoadingSceneAtFrameStart = Game.Scenes.IsMainLoading();
                 DequeueNextValues();
+
+                Game.Memory.SwapAllocationBuffers();
+                Game.Memory.UpdateGCMarkers(Frame.Index);
+                Game.Perf.CleanUpUnusedMetrics();
+
                 FlushQueue(s_FrameStartQueue);
 
                 FlushQueue(s_OnBootQueue);
-
-                Game.Memory.UpdateGCMarkers(Frame.Index);
-
                 Game.Input.BeginFrame();
+
 
                 // DEBUG UPDATE
                 Game.Components.Lock();
@@ -816,6 +874,9 @@ namespace FieldDay {
 
                     OnPreUpdate.Invoke(Frame.UnscaledDeltaTime);
                 }
+
+                Game.Gui.FlushCommands();
+                Game.Gui.FlushInputLayerChanges();
 
                 DequeueNextValues();
 

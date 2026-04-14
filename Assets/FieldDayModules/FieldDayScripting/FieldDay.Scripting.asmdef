@@ -1,6 +1,6 @@
 {
     "name": "FieldDay.Scripting",
-    "rootNamespace": "",
+    "rootNamespace": "FieldDay.Scripting",
     "references": [
         "BeauRoutine",
         "BeauUtil",
@@ -9,7 +9,9 @@
         "BeauUtil.Parse",
         "BeauPools",
         "FieldDay.Vox",
-        "BeauData"
+        "BeauData",
+        "Unity.Timeline",
+        "ScriptableBake"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
@@ -18,6 +20,12 @@
     "precompiledReferences": [],
     "autoReferenced": true,
     "defineConstraints": [],
-    "versionDefines": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.timeline",
+            "expression": "1.7.6",
+            "define": "USING_TIMELINE"
+        }
+    ],
     "noEngineReferences": false
 }

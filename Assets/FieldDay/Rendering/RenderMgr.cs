@@ -10,10 +10,14 @@
 #define USING_URP
 #endif // UNITY_2019_1_OR_NEWER
 
+using System;
 using System.Collections.Generic;
+using System.Reflection;
+using BeauPools;
 using BeauUtil;
 using BeauUtil.Debugger;
 using FieldDay.Debugging;
+using FieldDay.Perf;
 using UnityEngine;
 
 #if USE_SRP
@@ -26,6 +30,8 @@ using UnityEngine.Rendering.Universal;
 
 namespace FieldDay.Rendering {
     public sealed class RenderMgr : ICameraPreRenderCallback, ICameraPreCullCallback, ICameraPostRenderCallback {
+        #region Types
+
 #if DEVELOPMENT
 
         private struct CameraRestoreData {
@@ -35,6 +41,8 @@ namespace FieldDay.Rendering {
             public float FOV;
             public float Ortho;
             public int CullingMask;
+            public CameraClearFlags ClearFlags;
+            public Color32 BackgroundColor;
 
 #if USING_URP
             public AntialiasingMode AA;
@@ -45,6 +53,8 @@ namespace FieldDay.Rendering {
                 camera.cullingMask = CullingMask;
                 camera.orthographicSize = Ortho;
                 camera.fieldOfView = FOV;
+                camera.clearFlags = ClearFlags;
+                camera.backgroundColor = BackgroundColor;
 
 #if USING_URP
                 var data = camera.GetUniversalAdditionalCameraData();
@@ -64,6 +74,9 @@ namespace FieldDay.Rendering {
                 Ortho = camera.orthographicSize;
                 FOV = camera.fieldOfView;
 
+                ClearFlags = camera.clearFlags;
+                BackgroundColor = camera.backgroundColor;
+
 #if USING_URP
                 var data = camera.GetUniversalAdditionalCameraData();
                 if (data) {
@@ -77,11 +90,18 @@ namespace FieldDay.Rendering {
         }
 
         private struct DebugCameraAdjustments {
+            public enum ClearMode {
+                Default,
+                DepthClearOnly,
+                ColorClear,
+            }
+
             public bool DisablePostProcessing;
             public int DisableLayers;
             public int ForceLayers;
             public float? AdjustFOV;
             public float? AdjustOrthoSize;
+            public ClearMode Clear;
 
 #if USING_URP
             public AntialiasingMode? AA;
@@ -97,7 +117,7 @@ namespace FieldDay.Rendering {
                 }
 #endif // USING_URP
                 return DisablePostProcessing || DisableLayers != 0 || ForceLayers != 0
-                    || AdjustFOV.HasValue || AdjustOrthoSize.HasValue;
+                    || AdjustFOV.HasValue || AdjustOrthoSize.HasValue || Clear != ClearMode.Default;
             }
 
             public void Apply(Camera camera) {
@@ -107,6 +127,18 @@ namespace FieldDay.Rendering {
                 }
                 if (AdjustOrthoSize.HasValue) {
                     camera.orthographicSize = AdjustOrthoSize.Value;
+                }
+
+                switch(Clear) {
+                    case ClearMode.DepthClearOnly: {
+                        camera.clearFlags = CameraClearFlags.Depth;
+                        break;
+                    }
+                    case ClearMode.ColorClear: {
+                        camera.backgroundColor = s_DebugCameraClearColor;
+                        camera.clearFlags = CameraClearFlags.SolidColor;
+                        break;
+                    }
                 }
 
 #if USING_URP
@@ -127,13 +159,30 @@ namespace FieldDay.Rendering {
 
 #endif // DEVELOPMENT
 
+        [Serializable]
+        public struct Config {
+            public Camera FallbackCamera;
+            public Color DebugClearColor;
+            public Color LetterboxColor;
+            public DisplayConfiguration DisplayConfig;
+        }
+
         public struct CameraChangeData {
             public Camera Previous;
             public Camera New;
         }
 
+        private enum LightProbesState {
+            Clean,
+            Dirty,
+            Tetrahedralizing
+        }
+
+        #endregion // Types
+
         private bool m_LastKnownFullscreen;
         private Resolution m_LastKnownResolution;
+        private ScreenDpiType m_LastKnownDpi = (ScreenDpiType) (-1);
 
         private Camera m_PrimaryCamera;
         private Camera m_FallbackCamera;
@@ -141,18 +190,32 @@ namespace FieldDay.Rendering {
         private RingBuffer<CameraClampToVirtualViewport> m_ClampedViewportCameras = new RingBuffer<CameraClampToVirtualViewport>(2, RingBufferMode.Expand);
         private Rect m_VirtualViewport = new Rect(0, 0, 1, 1);
 
+        private DisplayConfiguration.Axis m_ReferenceResolutionAxis;
+        private int m_ReferenceResolutionWidth;
+        private int m_ReferenceResolutionHeight;
+        private int m_ScaledReferenceResolutionWidth;
+        private int m_ScaledReferenceResolutionHeight;
+
         private float m_MinAspect;
         private float m_MaxAspect;
         private bool m_HasLetterboxing;
+        private Color m_LetterboxColor;
 
         private bool m_ShouldCheckFallback = true;
         private bool m_UsingFallback = false;
         private ushort m_LastLetterboxFrameRendered = Frame.InvalidIndex;
 
+        private LightProbesState m_LightProbesState;
+        private long m_LightProbesKickTS;
+
+        private uint m_ManualRenderDepth;
+
 #if DEVELOPMENT
 
         private CameraRestoreData m_DebugPrimaryCameraRestore;
         private DebugCameraAdjustments m_DebugPrimaryCameraAdjustments;
+        
+        static private Color32 s_DebugCameraClearColor;
 
         private void CacheDebugCameraAdjustments() {
             m_DebugPrimaryCameraAdjustments.CachedActive = m_DebugPrimaryCameraAdjustments.CheckIsActive();
@@ -164,16 +227,21 @@ namespace FieldDay.Rendering {
 
         public readonly CastableEvent<bool> OnFullscreenChanged = new CastableEvent<bool>(2);
         public readonly CastableEvent<Resolution> OnResolutionChanged = new CastableEvent<Resolution>(2);
+        public readonly CastableEvent<ScreenDpiType> OnScreenDpiChanged = new CastableEvent<ScreenDpiType>(2);
         public readonly CastableEvent<CameraChangeData> OnPrimaryCameraChanged = new CastableEvent<CameraChangeData>(2);
 
         #endregion // Callbacks
 
         #region Events
 
-        internal void Initialize() {
+        internal void Initialize(Config config) {
             GameLoop.OnCanvasPreRender.Register(OnCanvasPreUpdate);
             GameLoop.OnApplicationPreRender.Register(OnApplicationPreRender);
             GameLoop.OnFrameAdvance.Register(OnApplicationPostRender);
+
+#if DEVELOPMENT
+            GameLoop.OnDebugUpdate.Register(OnDebugUpdate);
+#endif // DEVELOPMENT
 
             Game.Scenes.OnAnySceneUnloaded.Register(OnSceneLoadUnload);
             Game.Scenes.OnAnySceneEnabled.Register(OnSceneLoadUnload);
@@ -182,6 +250,37 @@ namespace FieldDay.Rendering {
             CameraHelper.AddOnPreCull(this);
             CameraHelper.AddOnPreRender(this);
             CameraHelper.AddOnPostRender(this);
+
+            m_FallbackCamera = config.FallbackCamera;
+            if (m_FallbackCamera) {
+                m_FallbackCamera.gameObject.SetActive(m_UsingFallback);
+            }
+
+            if (config.DebugClearColor == Color.clear) {
+                config.DebugClearColor = ColorBank.Magenta;
+            }
+            s_DebugCameraClearColor = config.DebugClearColor;
+
+            if (config.LetterboxColor == Color.clear) {
+                m_LetterboxColor = Color.black;
+            } else {
+                m_LetterboxColor = config.LetterboxColor;
+            }
+
+            if (config.DisplayConfig) {
+                EnableAspectClamping(config.DisplayConfig.MinimumAspectRatio, config.DisplayConfig.MaximumAspectRatio);
+                m_ReferenceResolutionWidth = config.DisplayConfig.ReferenceResolution.x;
+                m_ReferenceResolutionHeight = config.DisplayConfig.ReferenceResolution.y;
+                m_ReferenceResolutionAxis = config.DisplayConfig.ReferenceAxis;
+            } else {
+                EnableAspectClamping(new Vector2Int(4, 3), new Vector2Int(16, 9));
+                m_ReferenceResolutionAxis = DisplayConfiguration.Axis.Height;
+                m_ReferenceResolutionWidth = 1024;
+                m_ReferenceResolutionHeight = 768;
+            }
+
+            LightProbes.needsRetetrahedralization += OnLightProbesDirty;
+            LightProbes.tetrahedralizationCompleted += OnLightProbesFinishedCompute;
         }
 
         internal void LateInitialize() {
@@ -205,7 +304,27 @@ namespace FieldDay.Rendering {
 #endif // UNITY_2022_2_OR_NEWER
                 ) {
                 m_LastKnownResolution = resolution;
+                switch(m_ReferenceResolutionAxis) {
+                    case DisplayConfiguration.Axis.Width: {
+                        m_ScaledReferenceResolutionWidth = m_ReferenceResolutionWidth;
+                        m_ScaledReferenceResolutionHeight = m_ReferenceResolutionWidth * resolution.height / resolution.width;
+                        break;
+                    }
+                    case DisplayConfiguration.Axis.Height: {
+                        m_ScaledReferenceResolutionHeight = m_ReferenceResolutionHeight;
+                        m_ScaledReferenceResolutionWidth = m_ReferenceResolutionHeight * resolution.width / resolution.height;
+                        break;
+                    }
+                }
+
+                ScreenDpiType dpi = GetDpi(resolution);
+                bool dpiChanged = dpi != m_LastKnownDpi;
+                m_LastKnownDpi = dpi;
+
                 OnResolutionChanged.Invoke(resolution);
+                if (dpiChanged) {
+                    OnScreenDpiChanged.Invoke(dpi);
+                }
             }
         }
 
@@ -224,9 +343,33 @@ namespace FieldDay.Rendering {
 
             OnResolutionChanged.Clear();
             OnFullscreenChanged.Clear();
+            OnScreenDpiChanged.Clear();
+            OnPrimaryCameraChanged.Clear();
+
+            LightProbes.needsRetetrahedralization -= OnLightProbesDirty;
+            LightProbes.tetrahedralizationCompleted -= OnLightProbesFinishedCompute;
         }
 
         #endregion // Events
+
+        #region Dpi
+
+        public ScreenDpiType CurrentDpiType {
+            get { return m_LastKnownDpi; }
+        }
+
+        static private ScreenDpiType GetDpi(Resolution resolution) {
+            // TODO: improve logic? fewer hardcoded values
+            if (resolution.height > 2000) {
+                return ScreenDpiType.ExtraHigh;
+            }
+            if (resolution.height > 1200) {
+                return ScreenDpiType.High;
+            }
+            return ScreenDpiType.Normal;
+        }
+
+        #endregion // Dpi
 
         #region World Camera
 
@@ -351,8 +494,6 @@ namespace FieldDay.Rendering {
             go.SetActive(m_UsingFallback);
         }
 
-        // TODO: SetCustomFallbackCamera
-
         /// <summary>
         /// Marks the "fallback camera" state as dirty.
         /// This will force it to be reevaluated before the next render.
@@ -363,7 +504,55 @@ namespace FieldDay.Rendering {
 
         #endregion // Fallback
 
+        #region Lighting
+
+        /// <summary>
+        /// Tetrahedralizes light probes, if they need updating.
+        /// </summary>
+        public void TetrahedralizeLightProbes() {
+            if (m_LightProbesState == LightProbesState.Dirty) {
+                m_LightProbesState = LightProbesState.Tetrahedralizing;
+                m_LightProbesKickTS = Frame.Timestamp();
+                LightProbes.TetrahedralizeAsync();
+            }
+        }
+
+        /// <summary>
+        /// Returns if light probes are dirty or currently re-tetrahedralizing.
+        /// </summary>
+        public bool AreLightProbesDirty() {
+            return m_LightProbesState != LightProbesState.Clean;
+        }
+
+        #endregion // Lighting
+
+        #region Reference Resolution
+
+        public Vector2 ReferencePixelsToVirtualViewportUnits(Vector2 referencePixels) {
+            Vector2 viewport;
+            viewport.x = referencePixels.x / m_ScaledReferenceResolutionWidth * m_VirtualViewport.x;
+            viewport.y = referencePixels.y / m_ScaledReferenceResolutionHeight * m_VirtualViewport.y;
+            return viewport;
+        }
+
+        #endregion // Reference Resolution
+
         #region Handlers
+
+        private void OnLightProbesDirty() {
+            if (m_LightProbesState != LightProbesState.Dirty) {
+                m_LightProbesState = LightProbesState.Dirty;
+                Log.Msg("[RenderMgr] Light probes need retetrahedralizing");
+            }
+        }
+
+        private void OnLightProbesFinishedCompute() {
+            if (m_LightProbesState == LightProbesState.Tetrahedralizing) {
+                long ts = Frame.Timestamp() - m_LightProbesKickTS;
+                m_LightProbesState = LightProbesState.Clean;
+                Log.Msg("[RenderMgr] Light probes finished retetrahedralizing ({0}ms)", Profiling.TicksToMillisecs(ts));
+            }
+        }
 
         private void OnGuiCameraChanged(Camera uiCam) {
 #if USING_URP
@@ -414,6 +603,10 @@ namespace FieldDay.Rendering {
         }
 
         private void OnCanvasPreUpdate() {
+            if (m_ManualRenderDepth > 0) {
+                return;
+            }
+
 #if DEVELOPMENT
             if (DebugFlags.IsFlagSet(DebuggingFlags.TraceExecution)) {
                 Log.Trace("[RenderMgr] Canvas pre-update");
@@ -433,10 +626,12 @@ namespace FieldDay.Rendering {
             for(int i = 0; i < m_ClampedViewportCameras.Count; i++) {
                 ref var c = ref m_ClampedViewportCameras[i];
                 Rect r = c.Viewport;
-                r.x = m_VirtualViewport.x + r.x * m_VirtualViewport.width;
-                r.y = m_VirtualViewport.y + r.y * m_VirtualViewport.height;
-                r.width = r.width * m_VirtualViewport.width;
-                r.height = r.height * m_VirtualViewport.height;
+                Vector2 minOffset = ReferencePixelsToVirtualViewportUnits(c.MinPadding);
+                Vector2 maxOffset = ReferencePixelsToVirtualViewportUnits(c.MaxPadding);
+                r.x = m_VirtualViewport.x + (minOffset.x + r.x) * m_VirtualViewport.width;
+                r.y = m_VirtualViewport.y + (minOffset.y + r.y) * m_VirtualViewport.height;
+                r.width = (r.width - minOffset.x - maxOffset.x) * m_VirtualViewport.width;
+                r.height = (r.height - minOffset.y - maxOffset.y) * m_VirtualViewport.height;
                 c.Camera.rect = r;
             }
 
@@ -444,6 +639,10 @@ namespace FieldDay.Rendering {
         }
 
         private void OnApplicationPreRender() {
+            if (m_ManualRenderDepth > 0) {
+                return;
+            }
+
 #if DEVELOPMENT
             if (DebugFlags.IsFlagSet(DebuggingFlags.TraceExecution)) {
                 Log.Trace("[RenderMgr] Application pre-render");
@@ -454,6 +653,10 @@ namespace FieldDay.Rendering {
         }
 
         private void OnApplicationPostRender() {
+            if (m_ManualRenderDepth > 0) {
+                return;
+            }
+
 #if DEVELOPMENT
             if (DebugFlags.IsFlagSet(DebuggingFlags.TraceExecution)) {
                 Log.Trace("[RenderMgr] Application post-render");
@@ -490,7 +693,7 @@ namespace FieldDay.Rendering {
         #region Camera Callbacks
 
         void ICameraPreCullCallback.OnCameraPreCull(Camera inCamera, CameraCallbackSource inSource) {
-            if (!GameLoop.IsRenderingOrPreparingRendering() || !CameraUtility.IsGameCamera(inCamera)) {
+            if (m_ManualRenderDepth > 0 || !GameLoop.IsRenderingOrPreparingRendering() || !CameraUtility.IsGameCamera(inCamera)) {
                 return;
             }
 
@@ -514,7 +717,7 @@ namespace FieldDay.Rendering {
         }
 
         void ICameraPreRenderCallback.OnCameraPreRender(Camera inCamera, CameraCallbackSource inSource) {
-            if (!GameLoop.IsRendering() || !CameraUtility.IsGameCamera(inCamera)) {
+            if (m_ManualRenderDepth > 0 || !GameLoop.IsRendering() || !CameraUtility.IsGameCamera(inCamera)) {
                 return;
             }
 
@@ -576,7 +779,7 @@ namespace FieldDay.Rendering {
                     if (DebugFlags.IsFlagSet(DebuggingFlags.TraceExecution)) {
                         Log.Trace("[RenderMgr] Rendering letterboxing for viewport {0}", m_VirtualViewport.ToString());
                     }
-                    CameraHelper.RenderLetterboxing(m_VirtualViewport, Color.black);
+                    CameraHelper.RenderLetterboxing(m_VirtualViewport, m_LetterboxColor);
                     GL.PopMatrix();
                 }
 
@@ -593,9 +796,20 @@ namespace FieldDay.Rendering {
                     GL.Clear(true, true, Color.magenta, 1);
                     GL.PopMatrix();
 
-                    string debugText = string.Format("Screen Dimensions: {0} ({1})", m_LastKnownResolution, m_LastKnownFullscreen ? "FULLSCREEN" : "NOT FULLSCREEN");
+                    using(PooledStringBuilder psb = PooledStringBuilder.Create()) {
+                        psb.Builder.Append("Screen Dimensions: ").AppendNoAlloc(m_LastKnownResolution.width)
+                            .Append('x').AppendNoAlloc(m_LastKnownResolution.height);
 
-                    DebugDraw.AddViewportText(new Vector2(0.5f, 1), new Vector2(0, -8), debugText, Color.white, 0, TextAnchor.UpperCenter, DebugTextStyle.BackgroundDarkOpaque);
+                        if (m_LastKnownFullscreen) {
+                            psb.Builder.Append(" (FULLSCREEN)");
+                        }
+                        if (m_LastKnownDpi == ScreenDpiType.ExtraHigh) {
+                            psb.Builder.Append(" (X-HIGH DPI)");
+                        } else if (m_LastKnownDpi == ScreenDpiType.High) {
+                            psb.Builder.Append(" (HIGH DPI)");
+                        }
+                        DebugDraw.AddViewportText(new Vector2(0.5f, 1), new Vector2(0, -8), psb, Color.white, 0, TextAnchor.UpperCenter, DebugTextStyle.BackgroundDarkOpaque);
+                    }
                 }
 
                 if (switchedRenderTargets) {
@@ -605,7 +819,7 @@ namespace FieldDay.Rendering {
         }
 
         void ICameraPostRenderCallback.OnCameraPostRender(Camera inCamera, CameraCallbackSource inSource) {
-            if (!GameLoop.IsRendering() || !CameraUtility.IsGameCamera(inCamera)) {
+            if (m_ManualRenderDepth > 0 || !GameLoop.IsRendering() || !CameraUtility.IsGameCamera(inCamera)) {
                 return;
             }
 
@@ -634,29 +848,165 @@ namespace FieldDay.Rendering {
 
         private enum DebuggingFlags {
             TraceExecution,
-            VisualizeEntireScreen
+            VisualizeEntireScreen,
+            DisplayGPUInfo
+        }
+
+        static private float s_ScreenshotScale = 4;
+
+        /// <summary>
+        /// Scale of all screenshots.
+        /// </summary>
+        static public float ScreenshotScale {
+            get { return s_ScreenshotScale; }
+            set { s_ScreenshotScale = Mathf.Clamp(s_ScreenshotScale, 1, 8); }
         }
 
 #if DEVELOPMENT
 
+        private enum DebugMetricsGroup {
+            None,
+            Basic,
+            Vertex,
+            DrawCalls,
+            Batches,
+            RenderTargets,
+            Timings,
+        }
+
+        static private string s_CachedGraphicsDeviceName;
+        static private string s_CachedGraphicsDeviceVendor;
+        static private string s_CachedGraphicsDeviceVersion;
+        static private string s_CachedGraphicsDeviceType;
+        static private string s_CachedNPOTSupport;
+
+        static private DebugMetricsGroup s_SelectedMetricsGroup;
+
+        private void OnDebugUpdate() {
+            if (DebugFlags.IsFlagSet(DebuggingFlags.DisplayGPUInfo)) {
+                using (PooledStringBuilder psb = PooledStringBuilder.Create()) {
+                    psb.Builder
+                        .Append("GPU Type: ").Append(s_CachedGraphicsDeviceType ?? (s_CachedGraphicsDeviceType = SystemInfo.graphicsDeviceType.ToString()))
+                        .Append("\nGPU Name: ").Append(s_CachedGraphicsDeviceName ?? (s_CachedGraphicsDeviceName = SystemInfo.graphicsDeviceName))
+                        .Append(" (").AppendNoAlloc(SystemInfo.graphicsDeviceID).Append(")")
+                        .Append("\nGPU Vendor: ").Append(s_CachedGraphicsDeviceVendor ?? (s_CachedGraphicsDeviceVendor = SystemInfo.graphicsDeviceVendor))
+                        .Append(" (").AppendNoAlloc(SystemInfo.graphicsDeviceVendorID).Append(")")
+                        .Append("\nGPU Version: ").Append(s_CachedGraphicsDeviceVersion ?? (s_CachedGraphicsDeviceVersion = SystemInfo.graphicsDeviceVersion))
+                        .Append("\nGPU Memory Size: ").AppendNoAlloc(SystemInfo.graphicsMemorySize).Append("MiB")
+                        .Append("\nShader Level: ").AppendNoAlloc(SystemInfo.graphicsShaderLevel)
+                        .Append("\nMax Texture Size: ").AppendNoAlloc(SystemInfo.maxTextureSize)
+                        .Append("\nNPOT Support: ").Append(s_CachedNPOTSupport ?? (s_CachedNPOTSupport = SystemInfo.npotSupport.ToString()));
+
+                    DebugDraw.AddLogText(psb, ColorBank.LightGray);
+                }
+            }
+
+            if (s_SelectedMetricsGroup != DebugMetricsGroup.None) {
+                using(PooledStringBuilder psb = PooledStringBuilder.CreateLarge()) {
+                    switch(s_SelectedMetricsGroup) {
+                        case DebugMetricsGroup.Basic: {
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.VertexCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.TriangleCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.DrawCallsCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.SetPassCallsCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.BatchesCount);
+                            break;
+                        }
+                        case DebugMetricsGroup.Vertex: {
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.VertexCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.TriangleCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.StaticBatchedVerticesCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.StaticBatchedTrianglesCount);
+                            PerfMetric.WriteMetric(psb, RenderMetrics.VertexBufferUploadCount);
+                            psb.Builder.Append(" ("); PerfMetric.WriteMetricValue(psb, RenderMetrics.VertexBufferUploadBytes); psb.Builder.Append(")\n");
+                            PerfMetric.WriteMetric(psb, RenderMetrics.IndexBufferUploadCount);
+                            psb.Builder.Append(" ("); PerfMetric.WriteMetricValue(psb, RenderMetrics.IndexBufferUploadBytes); psb.Builder.Append(")\n");
+                            break;
+                        }
+
+                        case DebugMetricsGroup.DrawCalls: {
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.DrawCallsCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.SetPassCallsCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.MaterialSetPassFast);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.StaticBatchedDrawCallsCount);
+                            break;
+                        }
+
+                        case DebugMetricsGroup.Batches: {
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.BatchesCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.StaticBatchesCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.StaticBatchedVerticesCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.StaticBatchedTrianglesCount);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.StaticBatchedDrawCallsCount);
+                            break;
+                        }
+
+                        case DebugMetricsGroup.RenderTargets: {
+                            PerfMetric.WriteMetric(psb, RenderMetrics.RenderTexturesCount);
+                            psb.Builder.Append(" ("); PerfMetric.WriteMetricValue(psb, RenderMetrics.RenderTexturesBytes); psb.Builder.Append(")\n");
+                            break;
+                        }
+
+                        case DebugMetricsGroup.Timings: {
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.Culling);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.RenderPrepare);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.Clear);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.RenderOpaqueGeometry);
+                            PerfMetric.WriteMetricLine(psb, RenderMetrics.RenderTransparentGeometry);
+                            break;
+                        }
+                    }
+
+                    psb.Builder.TrimEnd(StringUtils.DefaultNewLineChars);
+                    DebugDraw.AddViewportText(new Vector2(1, 0), new Vector2(-8, 8), psb, Color.white, 0, TextAnchor.LowerRight, DebugTextStyle.BackgroundDarkOpaque);
+                }
+            }
+        }
+
         [EngineMenuFactory]
         static private DMInfo CreateRenderDebugMenu() {
             DMInfo info = new DMInfo("Rendering", 16);
-            DebugFlags.Menu.AddFlagToggle(info, "Trace Execution", DebuggingFlags.TraceExecution);
-            DebugFlags.Menu.AddSingleFrameFlagButton(info, "Trace Execution (Frame)", DebuggingFlags.TraceExecution);
-            DebugFlags.Menu.AddFlagToggle(info, "Render Debug Info", DebuggingFlags.VisualizeEntireScreen);
+
+            DMInfo screenshots = new DMInfo("Screenshots");
+            screenshots.AddSlider("Resolution Scale", () => s_ScreenshotScale, (v) => s_ScreenshotScale = v, 1, 8, 0.5f, (f) => string.Format("{0:0.0}x", f));
+            info.AddSubmenu(screenshots);
+
             info.AddDivider();
 
-            DMInfo postProcessingMenu = new DMInfo("Post Processing", 4);
-            postProcessingMenu.AddToggle("Suppress Post-Processing", () => Game.Rendering.m_DebugPrimaryCameraAdjustments.DisablePostProcessing, (b) => {
-                Game.Rendering.m_DebugPrimaryCameraAdjustments.DisablePostProcessing = b;
-                Game.Rendering.CacheDebugCameraAdjustments();
-            });
+            info.AddSelector("Debug Metrics",
+                () => (int)s_SelectedMetricsGroup,
+                (i) => s_SelectedMetricsGroup = (DebugMetricsGroup)i,
+                new string[] { "---", "Basic Stats", "Vertices", "Draw Calls", "Batches", "Render Targets", "Timing" });
+            info.AddDivider();
 
-            info.AddSubmenu(postProcessingMenu);
+            DMInfo debugOptions = new DMInfo("Debug Options");
+
+            DebugFlags.Menu.AddFlagToggle(debugOptions, "Trace Execution", DebuggingFlags.TraceExecution);
+            DebugFlags.Menu.AddSingleFrameFlagButton(debugOptions, "Trace Execution (Frame)", DebuggingFlags.TraceExecution);
+            DebugFlags.Menu.AddFlagToggle(debugOptions, "Render Screen Info", DebuggingFlags.VisualizeEntireScreen);
+            DebugFlags.Menu.AddFlagToggle(debugOptions, "Display GPU Info", DebuggingFlags.DisplayGPUInfo);
+
+            debugOptions.AddSelector("Clear Mode",
+                () => (int)Game.Rendering.m_DebugPrimaryCameraAdjustments.Clear,
+                (i) => {
+                    Game.Rendering.m_DebugPrimaryCameraAdjustments.Clear = (DebugCameraAdjustments.ClearMode)i;
+                    Game.Rendering.CacheDebugCameraAdjustments();
+                }, new string[] { "---", "Depth Only", "Debug Color" });
+
+            debugOptions.AddSelector("Post Processing", () => Game.Rendering.m_DebugPrimaryCameraAdjustments.DisablePostProcessing ? 1 : 0,
+                (i) => {
+                    Game.Rendering.m_DebugPrimaryCameraAdjustments.DisablePostProcessing = i == 1;
+                    Game.Rendering.CacheDebugCameraAdjustments();
+                }, new string[] { "---", "Suppress" });
+
+            info.AddSubmenu(debugOptions);
+
+            info.AddDivider();
 
             DMInfo renderLayerMenu = new DMInfo("Rendering Layers");
             renderLayerMenu.MinimumWidth = 250;
+
+            string[] layerSelectorLabels = new string[] { "---", "Disabled", "Always" };
 
             for (int i = 0; i < 32; i++) {
                 string layerName = LayerMask.LayerToName(i);
@@ -666,7 +1016,7 @@ namespace FieldDay.Rendering {
                 }
 
                 int idx = i;
-                renderLayerMenu.AddSlider(layerName, () => {
+                renderLayerMenu.AddSelector(layerName, () => {
                     if (Bits.Contains(Game.Rendering.m_DebugPrimaryCameraAdjustments.ForceLayers, idx)) {
                         return 2;
                     } else if (Bits.Contains(Game.Rendering.m_DebugPrimaryCameraAdjustments.DisableLayers, idx)) {
@@ -678,18 +1028,12 @@ namespace FieldDay.Rendering {
                     Bits.Set(ref Game.Rendering.m_DebugPrimaryCameraAdjustments.ForceLayers, idx, f == 2);
                     Bits.Set(ref Game.Rendering.m_DebugPrimaryCameraAdjustments.DisableLayers, idx, f == 1);
                     Game.Rendering.CacheDebugCameraAdjustments();
-                }, 0, 2, 1, (f) => {
-                    if (f == 0) {
-                        return "(Scene Default)";
-                    } else if (f == 1) {
-                        return "Disabled";
-                    } else {
-                        return "Always";
-                    }
-                });
+                }, layerSelectorLabels);
             }
 
             info.AddSubmenu(renderLayerMenu);
+
+            DMInfo qualitySettings = new DMInfo("Quality Settings");
 
             DMInfo antialiasingSettings = new DMInfo("Antialiasing");
             antialiasingSettings.MinimumWidth = 250;
@@ -710,7 +1054,7 @@ namespace FieldDay.Rendering {
             }, 0, 3, 1, (f) => {
                 int m = (int) f;
                 if (m == 0) {
-                    return "(Scene Default)";
+                    return "---";
                 } else {
                     return ((AntialiasingMode) (m - 1)).ToString();
                 }
@@ -731,7 +1075,7 @@ namespace FieldDay.Rendering {
             }, 0, 3, 1, (f) => {
                 int m = (int) f;
                 if (m == 0) {
-                    return "(Scene Default)";
+                    return "---";
                 } else {
                     return ((AntialiasingQuality) (m - 1)).ToString();
                 }
@@ -740,11 +1084,68 @@ namespace FieldDay.Rendering {
 
 #endif // USING_URP
 
-            info.AddSubmenu(antialiasingSettings);
-
-            DMInfo qualitySettings = new DMInfo("Quality Settings");
+            qualitySettings.AddSubmenu(antialiasingSettings);
 
             info.AddSubmenu(qualitySettings);
+
+            DMInfo auditMenu = new DMInfo("Audit GPU Support");
+
+            auditMenu.AddButton("Find Unsupported Shaders", () => {
+                var allShaders = Resources.FindObjectsOfTypeAll<Shader>();
+                using(PooledStringBuilder psb = PooledStringBuilder.Create()) {
+                    int totalUnsupported = 0;
+                    foreach(var shader in allShaders) {
+                        if (!shader.isSupported) {
+                            totalUnsupported++;
+                            psb.Builder.Append("\nShader '").Append(shader.name).Append("' unsupported!");
+                        }
+                    }
+
+                    if (totalUnsupported == 0) {
+                        psb.Builder.Append("No unsupported shaders found!");
+                        DebugDraw.AddLogText(psb, Color.white, 4);
+                        Log.Msg(psb.Builder.ToString());
+                    } else {
+                        psb.Builder.Insert(0, string.Format("{0}/{1} shaders unsupported!", totalUnsupported, allShaders.Length));
+                        DebugDraw.AddLogText(psb, Color.red, 8);
+                        Log.Warn(psb.Builder.ToString());
+                    }
+                }
+            });
+            auditMenu.AddButton("Print Texture Format Support", () => {
+                using (PooledStringBuilder psb = PooledStringBuilder.Create()) {
+                    var allFormatFields = typeof(TextureFormat).GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.DeclaredOnly);
+                    int totalUnsupported = 0;
+                    int totalFormats = 0;
+                    foreach (var field in allFormatFields) {
+                        if (field.IsDefined(typeof(HiddenAttribute)) || field.IsDefined(typeof(ObsoleteAttribute))) {
+                            continue;
+                        }
+
+                        totalFormats++;
+                        TextureFormat format = (TextureFormat)field.GetValue(null);
+
+                        if (!SystemInfo.SupportsTextureFormat(format)) {
+                            totalUnsupported++;
+                            psb.Builder.Append("\nFormat '").Append(field.Name).Append("' unsupported!");
+                        } else {
+                            psb.Builder.Append("\n<color=#FFFFFF>Format '").Append(field.Name).Append("' is supported!</color>");
+                        }
+                    }
+
+                    if (totalUnsupported == 0) {
+                        psb.Builder.Append("No unsupported texture formats found!");
+                        DebugDraw.AddLogText(psb, Color.white, 4);
+                        Log.Msg(psb.Builder.ToString());
+                    } else {
+                        psb.Builder.Insert(0, string.Format("{0}/{1} texture formats unsupported!", totalUnsupported, totalFormats));
+                        DebugDraw.AddLogText(psb, Color.red, 8);
+                        Log.Warn(psb.Builder.ToString());
+                    }
+                }
+            });
+
+            info.AddSubmenu(auditMenu);
 
             return info;
         }
@@ -752,5 +1153,68 @@ namespace FieldDay.Rendering {
 #endif // DEVELOPMENT
 
         #endregion // Debug
+
+        #region Manual Rendering
+
+        public void PushManualRender() {
+            m_ManualRenderDepth++;
+        }
+
+        public void PopManualRender() {
+            Assert.True(m_ManualRenderDepth > 0);
+            m_ManualRenderDepth--;
+        }
+
+        #endregion // Manual Rendering
+    }
+
+    /// <summary>
+    /// Type of screen dpi.
+    /// </summary>
+    public enum ScreenDpiType {
+        Normal,
+        High,
+        ExtraHigh
+    }
+
+    /// <summary>
+    /// Rendering metrics set.
+    /// </summary>
+    static public class RenderMetrics {
+        static public readonly PerfMetric VertexCount = new PerfMetric(PerfMetric.Categories.Render, "Vertices Count");
+        static public readonly PerfMetric TriangleCount = new PerfMetric(PerfMetric.Categories.Render, "Triangles Count");
+        static public readonly PerfMetric SetPassCallsCount = new PerfMetric(PerfMetric.Categories.Render, "SetPass Calls Count");
+        static public readonly PerfMetric DrawCallsCount = new PerfMetric(PerfMetric.Categories.Render, "Draw Calls Count");
+        static public readonly PerfMetric MaterialSetPassFast = new PerfMetric(PerfMetric.Categories.Render, "Material.SetPassFast", "Material SetPass");
+        static public readonly PerfMetric BatchesCount = new PerfMetric(PerfMetric.Categories.Render, "Batches Count");
+
+        static public readonly PerfMetric RenderTexturesCount = new PerfMetric(PerfMetric.Categories.Render, "Render Textures Count");
+        static public readonly PerfMetric RenderTexturesBytes = new PerfMetric(PerfMetric.Categories.Render, "Render Textures Bytes");
+
+        static public readonly PerfMetric UsedBuffersCount = new PerfMetric(PerfMetric.Categories.Render, "Used Buffers Count");
+        static public readonly PerfMetric UsedBuffersBytes = new PerfMetric(PerfMetric.Categories.Render, "Used Buffers Bytes");
+
+        static public readonly PerfMetric UsedTexturesCount = new PerfMetric(PerfMetric.Categories.Render, "Used Textures Count");
+        static public readonly PerfMetric UsedTexturesBytes = new PerfMetric(PerfMetric.Categories.Render, "Used Textures Bytes");
+
+        static public readonly PerfMetric VertexBufferUploadCount = new PerfMetric(PerfMetric.Categories.Render, "Vertex Buffer Upload In Frame Count");
+        static public readonly PerfMetric VertexBufferUploadBytes = new PerfMetric(PerfMetric.Categories.Render, "Vertex Buffer Upload In Frame Bytes");
+
+        static public readonly PerfMetric IndexBufferUploadCount = new PerfMetric(PerfMetric.Categories.Render, "Index Buffer Upload In Frame Count");
+        static public readonly PerfMetric IndexBufferUploadBytes = new PerfMetric(PerfMetric.Categories.Render, "Index Buffer Upload In Frame Bytes");
+
+        static public readonly PerfMetric StaticBatchedVerticesCount = new PerfMetric(PerfMetric.Categories.Render, "Static Batched Vertices Count");
+        static public readonly PerfMetric StaticBatchedTrianglesCount = new PerfMetric(PerfMetric.Categories.Render, "Static Batched Triangles Count");
+        static public readonly PerfMetric StaticBatchedDrawCallsCount = new PerfMetric(PerfMetric.Categories.Render, "Static Batched Draw Calls Count");
+        static public readonly PerfMetric StaticBatchesCount = new PerfMetric(PerfMetric.Categories.Render, "Static Batches Count");
+
+        static public readonly PerfMetric RenderOpaqueGeometry = new PerfMetric(PerfMetric.Categories.Render, "Render.OpaqueGeometry", "Render Opaque Geo");
+        static public readonly PerfMetric RenderTransparentGeometry = new PerfMetric(PerfMetric.Categories.Render, "Render.TransparentGeometry", "Render Transparent Geo");
+        static public readonly PerfMetric RenderPrepare = new PerfMetric(PerfMetric.Categories.Render, "Render.Prepare", "Render Prepare");
+        static public readonly PerfMetric Culling = new PerfMetric(PerfMetric.Categories.Render, "Culling");
+        static public readonly PerfMetric Clear = new PerfMetric(PerfMetric.Categories.Render, "Clear");
+
+        static public readonly PerfMetric ShaderParse = new PerfMetric(PerfMetric.Categories.Render, "Shader.ParseMainThread", "Shader Parse (Main)");
+        static public readonly PerfMetric ShaderParseThreaded = new PerfMetric(PerfMetric.Categories.Render, "Shader.ParseThreaded", "Shader Parse (Threaded)");
     }
 }

@@ -12,7 +12,9 @@ using BeauPools;
 using BeauUtil;
 using BeauUtil.Debugger;
 using FieldDay.Debugging;
-using FieldDay.Pipes;
+using FieldDay.Files;
+using FieldDay.Perf;
+using FieldDay.Collections;
 using UnityEngine;
 
 namespace FieldDay.Audio {
@@ -30,6 +32,7 @@ namespace FieldDay.Audio {
 
         public const int MaxVoices = 80;
         public const int MaxBuses = 16;
+        public const int MaxStreamedClips = 24;
 
         #region State
 
@@ -55,6 +58,7 @@ namespace FieldDay.Audio {
 
         private IPool<AudioVoiceComponents> m_VoiceComponentPool;
         private IPool<VoiceData> m_VoiceDataPool;
+        private IPool<StreamedClip> m_StreamedClipPool;
 
         private BusData[] m_BusData;
         private int m_BusCount;
@@ -67,6 +71,7 @@ namespace FieldDay.Audio {
         private AudioPropertyBlock[] m_DebugBusProperties;
 #endif // DEVELOPMENT
 
+        private RingBuffer<StreamedClip> m_ActiveStreamedClips = new RingBuffer<StreamedClip>(MaxStreamedClips);
         private RingBuffer<VoiceData> m_ActiveVoices = new RingBuffer<VoiceData>(MaxVoices);
         private RingBuffer<MixData> m_ActiveMixStates = new RingBuffer<MixData>(16, RingBufferMode.Expand);
         private RingBuffer<AudioClip> m_PreloadQueue = new RingBuffer<AudioClip>(32, RingBufferMode.Expand);
@@ -132,6 +137,9 @@ namespace FieldDay.Audio {
             });
             m_VoiceComponentPool.Prewarm(MaxVoices);
 
+            m_StreamedClipPool = new FixedPool<StreamedClip>(MaxStreamedClips, Pool.DefaultConstructor<StreamedClip>());
+            m_StreamedClipPool.Prewarm(MaxStreamedClips);
+
             if (config.DefaultEmitterProfile) {
                 m_DefaultEmitterConfig = config.DefaultEmitterProfile.Config;
                 if (!Game.Assets.HasNamed<AudioEmitterProfile>(config.DefaultEmitterProfile.AssetId)) {
@@ -157,6 +165,10 @@ namespace FieldDay.Audio {
             using (Profiling.Sample("AudioMgr::PreUpdate")) {
                 ProcessLateBindings();
                 CullFinishedVoices();
+                if (m_ActiveStreamedClips.Count > 0) {
+                    UnloadOneUnusedStreamedClip();
+                }
+
                 FlushCommandPipe();
             }
         }
@@ -187,6 +199,7 @@ namespace FieldDay.Audio {
                 UpdateTweens(deltaTime);
                 UpdateBuses();
                 UpdateMixers(deltaTime);
+                PropagateBusProperties();
                 UpdateVoices(deltaTime, Time.realtimeSinceStartupAsDouble);
 
                 switch (Frame.Index % 60) {
@@ -222,7 +235,8 @@ namespace FieldDay.Audio {
                         .Append("\n   Active Tweens: ").AppendNoAlloc(m_FloatTweenList.Length)
                         .Append("\n   Active Position Trackers: ").AppendNoAlloc(m_PositionSyncList.Length)
                         .Append("\n   Active Mixers: ").AppendNoAlloc(m_ActiveMixStates.Count)
-                        .Append("\n   Clip Preload Queue: ").AppendNoAlloc(m_PreloadQueue.Count);
+                        .Append("\n   Clip Preload Queue: ").AppendNoAlloc(m_PreloadQueue.Count)
+                        .Append("\n   Streaming Clips: ").AppendNoAlloc(m_ActiveStreamedClips.Count);
 
                     DebugDraw.AddLogText(psb, ColorBank.Aqua);
                 }
@@ -234,8 +248,12 @@ namespace FieldDay.Audio {
                     foreach (var voice in m_ActiveVoices) {
                         psb.Builder.Append("\n   ").Append(voice.DebugName);
                         AudioSource src = voice.Components.Source;
-                        psb.Builder.Append(" (").AppendNoAlloc(src.time, 2).Append('/')
-                            .AppendNoAlloc(src.clip.length, 2);
+                        psb.Builder.Append(" (");
+                        if (src.clip) {
+                            psb.Builder.AppendNoAlloc(src.time, 2).Append('/').AppendNoAlloc(src.clip.length, 2);
+                        } else {
+                            psb.Builder.Append("???");
+                        }
                         if (src.loop) {
                             psb.Builder.Append('L');
                         }
@@ -256,7 +274,7 @@ namespace FieldDay.Audio {
                         }
                     }
 
-                    DebugDraw.AddViewportText(new Vector2(0, 1), new Vector2(8, -8), psb, ColorBank.Teal, 0, TextAnchor.UpperLeft, DebugTextStyle.BackgroundDark); ;
+                    DebugDraw.AddViewportText(new Vector2(0, 1), new Vector2(8, -8), psb, ColorBank.Aqua, 0, TextAnchor.UpperLeft, DebugTextStyle.BackgroundDark); ;
                 }
             }
 
@@ -275,7 +293,7 @@ namespace FieldDay.Audio {
                             .Append(" / ").AppendNoAlloc(scriptProps.Pitch, 2).Append(" / ").AppendNoAlloc(lastProps.Pitch, 2);
                     }
 
-                    DebugDraw.AddViewportText(new Vector2(0, 1), new Vector2(8, -8), psb, ColorBank.Teal, 0, TextAnchor.UpperLeft, DebugTextStyle.BackgroundDark); ;
+                    DebugDraw.AddViewportText(new Vector2(0, 1), new Vector2(8, -8), psb, ColorBank.Aqua, 0, TextAnchor.UpperLeft, DebugTextStyle.BackgroundDark); ;
                 }
             }
 
@@ -287,7 +305,29 @@ namespace FieldDay.Audio {
                         psb.Builder.Append(" (").AppendNoAlloc(mix.Mix, 2).Append("/").AppendNoAlloc(mix.TargetMix, 2).Append(")");
                     }
 
-                    DebugDraw.AddViewportText(new Vector2(0, 1), new Vector2(8, -8), psb, ColorBank.Teal, 0, TextAnchor.UpperLeft, DebugTextStyle.BackgroundDark);
+                    DebugDraw.AddViewportText(new Vector2(0, 1), new Vector2(8, -8), psb, ColorBank.Aqua, 0, TextAnchor.UpperLeft, DebugTextStyle.BackgroundDark);
+                }
+            }
+
+            if (DebugFlags.IsFlagSet(DebuggingFlags.DisplayStreamList)) {
+                using (PooledStringBuilder psb = PooledStringBuilder.Create()) {
+                    psb.Builder.Append("Stream Count: ").AppendNoAlloc(m_ActiveStreamedClips.Count);
+                    foreach (var clip in m_ActiveStreamedClips) {
+                        psb.Builder.Append("\n   ").Append(clip.Path);
+                        psb.Builder.Append(" (").AppendNoAlloc(clip.RefCount).Append(" references)");
+                        psb.Builder.Append("\n      State: ");
+                        if ((clip.Flags & StreamedClipFlags.Error) != 0) {
+                            psb.Builder.Append("FAILED!!");
+                        } else if ((clip.Flags & StreamedClipFlags.Loaded) != 0) {
+                            psb.Builder.Append("LOADED");
+                        } else if ((clip.Flags & StreamedClipFlags.Loading) != 0) {
+                            psb.Builder.Append("LOADING...");
+                        } else {
+                            psb.Builder.Append("UNLOADED");
+                        }
+                    }
+
+                    DebugDraw.AddViewportText(new Vector2(0, 1), new Vector2(8, -8), psb, ColorBank.Aqua, 0, TextAnchor.UpperLeft, DebugTextStyle.BackgroundDark);
                 }
             }
         }
@@ -297,11 +337,16 @@ namespace FieldDay.Audio {
             Unsafe.TryDestroyArena(ref m_Arena);
             m_TargetablePropertyBlocks = default;
 
+            foreach(var streamedClip in m_ActiveStreamedClips) {
+                UnloadStreamed(streamedClip);
+            }
+
             foreach(var voice in m_ActiveVoices) {
                 if ((voice.Flags & AudioPlaybackFlags.UseProvidedSource) == 0) {
                     m_VoiceComponentPool.Free(voice.Components);
                 }
             }
+
             m_VoiceComponentPool.Clear();
         }
 
@@ -321,10 +366,28 @@ namespace FieldDay.Audio {
         }
 
         private void OnAudioEventLoaded(AudioEvent evt) {
-            if (evt.PreloadSamples) {
-                foreach (var clip in evt.Samples) {
-                    if (!clip.preloadAudioData && clip.loadState == AudioDataLoadState.Unloaded) {
-                        m_PreloadQueue.PushBack(clip);
+            if (!string.IsNullOrEmpty(evt.Stream)) {
+                if (evt.CachedStreamedClipKey == 0) {
+                    evt.CachedStreamedClipKey = FileSystem.CalculatePathHash(evt.Stream, FileLocation.Streaming);
+                }
+            }
+
+            if (evt.CachedStreamedClipKey != 0) {
+                StreamedClip streamedClip = GetOrCreateStreamedClip(evt.CachedStreamedClipKey, evt.Stream, FileLocation.Streaming);
+
+                streamedClip.EventCount++;
+                streamedClip.RefCount++;
+                Assert.True(streamedClip.RefCount != 0, "Too many references to streamed clip");
+
+                if (evt.PreloadSamples) {
+                    LoadStreamed(streamedClip, FileLoadPriority.High);
+                }
+            } else {
+                if (evt.PreloadSamples) {
+                    foreach (var clip in evt.Samples) {
+                        if (!clip.preloadAudioData && clip.loadState == AudioDataLoadState.Unloaded) {
+                            m_PreloadQueue.PushBack(clip);
+                        }
                     }
                 }
             }
@@ -335,7 +398,13 @@ namespace FieldDay.Audio {
         }
 
         private void OnAudioEventUnloaded(AudioEvent evt) {
-            // nothing
+            if (evt.CachedStreamedClipKey != 0) {
+                StreamedClip clip = GetStreamedClip(evt.CachedStreamedClipKey);
+                Assert.True(clip.RefCount > 0);
+                Assert.True(clip.EventCount > 0);
+                clip.RefCount--;
+                clip.EventCount--;
+            }
         }
 
         private void OnAudioMixerStateLoaded(AudioMixState mix) {
@@ -444,6 +513,38 @@ namespace FieldDay.Audio {
             }
         }
 
+        /// <summary>
+        /// Queues clips from an AudioEvent to be preloaded.
+        /// </summary>
+        public void QueuePreload(StringHash32 eventId) {
+            if (!eventId.IsEmpty) {
+                AudioEvent evt = Find.NamedAsset<AudioEvent>(eventId);
+                if (evt.CachedStreamedClipKey != 0) {
+                    StreamedClip streamedClip = GetStreamedClip(evt.CachedStreamedClipKey);
+                    LoadStreamed(streamedClip, FileLoadPriority.High);
+                } else {
+                    foreach(var sample in evt.Samples) {
+                        m_PreloadQueue.PushBack(sample);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Queues clips from an AudioEvent to be unloaded.
+        /// </summary>
+        public void QueueUnload(StringHash32 eventId) {
+            if (!eventId.IsEmpty) {
+                AudioEvent evt = Find.NamedAsset<AudioEvent>(eventId);
+                if (evt.CachedStreamedClipKey != 0) {
+                    StreamedClip streamedClip = GetStreamedClip(evt.CachedStreamedClipKey);
+                    if (streamedClip != null) {
+                        streamedClip.Flags |= StreamedClipFlags.EagerUnload;
+                    }
+                }
+            }
+        }
+
         #endregion // Preload
 
         #region Debug
@@ -490,7 +591,8 @@ namespace FieldDay.Audio {
             DisplayStats,
             DisplayVoiceList,
             DisplayBusList,
-            DisplayMixerList
+            DisplayMixerList,
+            DisplayStreamList
         }
 
 #if DEVELOPMENT
@@ -498,14 +600,16 @@ namespace FieldDay.Audio {
         [EngineMenuFactory]
         static private DMInfo CreateAudioDebugMenu() {
             DMInfo info = new DMInfo("Audio", 16);
+            DebugFlags.Menu.AddFlagToggle(info, "Trace Execution", DebuggingFlags.TraceExecution);
             DebugFlags.Menu.AddSingleFrameFlagButton(info, "Trace Execution for Frame", DebuggingFlags.TraceExecution);
             info.AddDivider();
             DebugFlags.Menu.AddFlagToggle(info, "Display Stats", DebuggingFlags.DisplayStats);
             DebugFlags.Menu.AddFlagToggle(info, "Display Voices", DebuggingFlags.DisplayVoiceList);
             DebugFlags.Menu.AddFlagToggle(info, "Display Buses", DebuggingFlags.DisplayBusList);
             DebugFlags.Menu.AddFlagToggle(info, "Display Mixers", DebuggingFlags.DisplayMixerList);
+            DebugFlags.Menu.AddFlagToggle(info, "Display Streams", DebuggingFlags.DisplayStreamList);
 
-            DebugFlags.AddToggleGroup(DebuggingFlags.DisplayVoiceList, DebuggingFlags.DisplayMixerList, DebuggingFlags.DisplayBusList);
+            DebugFlags.AddToggleGroup(DebuggingFlags.DisplayVoiceList, DebuggingFlags.DisplayMixerList, DebuggingFlags.DisplayBusList, DebuggingFlags.DisplayStreamList);
 
             return info;
         }
@@ -513,5 +617,13 @@ namespace FieldDay.Audio {
 #endif // DEVELOPMENT
 
         #endregion // Debug
+    }
+
+    static public class AudioMetrics {
+        static public readonly PerfMetric AudioSourceUpdate = new PerfMetric(PerfMetric.Categories.Audio, "AudioSource.Update");
+        static public readonly PerfMetric UsedMemory = new PerfMetric(PerfMetric.Categories.Memory, "Audio Used Memory");
+        static public readonly PerfMetric ReservedMemory = new PerfMetric(PerfMetric.Categories.Memory, "Audio Reserved Memory");
+        static public readonly PerfMetric AudioClipCount = new PerfMetric(PerfMetric.Categories.Audio, "AudioClip Count");
+        static public readonly PerfMetric AudioClipMemory = new PerfMetric(PerfMetric.Categories.Audio, "AudioClip Memory");
     }
 }
